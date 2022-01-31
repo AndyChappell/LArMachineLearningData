@@ -54,16 +54,21 @@ def DrawVariables(X, Y):
 #--------------------------------------------------------------------------------------------------
 
 def DrawVariablesDF(df, parameters):
+    pivot_table = df.pivot(columns='Labels')
     for column in df:
         if column == 'Labels':
             continue
 
-        fig, ax = plt.subplots()
-        df.pivot(columns='Labels')[column].plot.hist(bins=50, alpha=0.5, color=parameters['signalCols'],
+        fig, ax = plt.subplots(figsize=parameters['figsize'])
+        plot_column = pivot_table[column]
+        plot_column.plot.hist(bins=50, alpha=0.5, color=parameters['signalCols'],
                 edgecolor='k', density=True, ax=ax)
 
-        ax.legend(parameters['labelNames']);
-        ax.set_xlabel(column.replace("_", " "))
+        ax.legend(parameters['labelNames'], fontsize=parameters['titlesize']);
+        ax.set_xlabel(column.replace("_", " "), fontsize=parameters['titlesize'])
+        ax.set_ylabel("Density", fontsize=parameters['titlesize'])
+        ax.tick_params(axis='x', labelsize=parameters['labelsize'])
+        ax.tick_params(axis='y', labelsize=parameters['labelsize'])
 
         if parameters['logY']:
             ax.yscale('log')
@@ -134,18 +139,22 @@ def Correlation(X, Y):
 
 #--------------------------------------------------------------------------------------------------
 
-def CorrelationDF(df, label):
-    plt.figure(figsize=(10, 10))
-    plt.title(label)
-
-    ax = sns.heatmap(df.corr(), cmap='coolwarm', vmax=1.0, vmin=-1.0,
-                     annot=True, square=True, fmt='.2g')
-
+def CorrelationDF(df, label, parameters):
+    n_vars = len(df.columns)
+    scale = max(1, n_vars // 10)
+    plt.figure(figsize=(2 * n_vars, 2 * n_vars))
+    plt.title(label, fontsize=scale * parameters['titlesize'])
+    corr_mat = df.corr()
+    sns.set(font_scale=2*scale)
+    ax = sns.heatmap(corr_mat, cmap='coolwarm', vmax=1.0, vmin=-1.0,
+                     annot=True, square=True, fmt='.2g', annot_kws={"size": parameters['titlesize']})
+    plt.tick_params(axis='both', which='major', labelsize=scale * parameters['titlesize'])
     ax.invert_yaxis()
-    # ax.set_ylim(-0., len(df.columns)-0.5)
+    # ax.set_ylim(-0., n_vars-0.5)
     plt.savefig(label.replace(" ", "_") + ".pdf", bbox_inches='tight')
     plt.show()
     plt.close()
+    sns.set(font_scale=1)
 
 #--------------------------------------------------------------------------------------------------
 
@@ -349,7 +358,7 @@ def PlotBdtKSScores(bdtModel, X_test, Y_test, X_train, Y_train, title, parameter
     test_results_background = test_results[Y_test == 0]
     train_results_background = train_results[Y_train == 0]
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(16,12))
     ax.set_title(title)
 
     sigEff = 0
@@ -403,4 +412,4 @@ def PlotBdtKSScores(bdtModel, X_test, Y_test, X_train, Y_train, title, parameter
     plt.xlabel('Score')
     plt.tight_layout()
 
-    plt.savefig('TrainingBdt_NTrees_' + str(parameters['nTrees']) + '_TreeDepth_' + str(parameters['TreeDepth']) + '_' + title + '.pdf')
+    plt.savefig('TrainingBdt_NTrees_' + str(bdtModel.n_estimators) + '_TreeDepth_' + str(bdtModel.estimators_[0].max_depth) + '_' + title + '.pdf')

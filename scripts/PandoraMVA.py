@@ -25,7 +25,7 @@ def LoadData(trainingFileName, delimiter=','):
 
 #--------------------------------------------------------------------------------------------------
 
-def SplitTrainingSet(trainingSet, nFeatures):
+def SplitTrainingSet(trainingSet, nFeatures, drop_indices=[]):
     X=[] # features sets
     Y=[] # responses
 
@@ -37,7 +37,13 @@ def SplitTrainingSet(trainingSet, nFeatures):
 
         X.append(features)
 
-    return np.array(X).astype(np.float64), np.array(Y).astype(np.int)
+    X = np.array(X).astype(np.float64)
+    Y = np.array(Y).astype(np.int)
+
+    if len(drop_indices) > 0:
+        X = np.delete(X, drop_indices, 1)
+
+    return X, Y
 
 #--------------------------------------------------------------------------------------------------
 
