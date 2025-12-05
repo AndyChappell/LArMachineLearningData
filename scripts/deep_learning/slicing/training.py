@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
@@ -50,7 +51,6 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, scaler=No
     return running_loss / len(train_loader)
 
 
-
 @torch.no_grad()
 def validate(model, val_loader, criterion, device):
     model.eval()
@@ -70,3 +70,33 @@ def validate(model, val_loader, criterion, device):
         pbar.set_postfix({"loss": loss.item()})
 
     return running_loss / len(val_loader)
+
+
+def save_checkpoint(model, optimizer, epoch, path):
+    ckpt = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    torch.save(ckpt, path)
+    print(f"✓ Saved checkpoint to {path}")
+
+
+def load_or_initialize_model(model_class, model_kwargs, checkpoint_path=None, device="cuda"):
+    """
+    model_class:   the class object, e.g. MyTransformer
+    model_kwargs:  dict of kwargs to instantiate the model
+    checkpoint_path: path to a saved checkpoint .pt/.pth
+    """
+    # Instantiate model
+    model = model_class(**model_kwargs).to(device)
+
+    if checkpoint_path is not None and os.path.isfile(checkpoint_path):
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print("✓ Model weights restored.")
+    else:
+        print("✓ Initializing new model.")
+
+    return model
