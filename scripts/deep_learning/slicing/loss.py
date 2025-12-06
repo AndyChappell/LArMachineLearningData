@@ -9,7 +9,7 @@ class ObjectCondensationLoss(nn.Module):
             attraction_weight=1.0,
             repulsion_weight=1.0,
             beta_positive_weight=5.0,#1.0,
-            beta_negative_weight=0.5,
+            beta_negative_weight=3.0,#0.5,
             margin_weight=5.0,#1.0,
             threshold=0.5,
             margin=0.2#0.1
@@ -63,12 +63,11 @@ class ObjectCondensationLoss(nn.Module):
 
             non_cp_mask = (~cp_mask)
             if non_cp_mask.sum() > 0:
-                neg_bce = focal_bce(beta_b[non_cp_mask], torch.zeros_like(beta_b[non_cp_mask]), alpha=0.25, gamma=2.0)
-                #neg_bce = F.binary_cross_entropy_with_logits(
-                #    beta_b[non_cp_mask],
-                #    torch.zeros_like(beta_b[non_cp_mask]),
-                #    reduction="mean"
-                #)
+                neg_bce = F.binary_cross_entropy_with_logits(
+                    beta_b[non_cp_mask],
+                    torch.zeros_like(beta_b[non_cp_mask]),
+                    reduction="mean"
+                )
             else:
                 neg_bce = 0.0
 
