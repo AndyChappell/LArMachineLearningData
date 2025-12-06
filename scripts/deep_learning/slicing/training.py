@@ -49,27 +49,48 @@ def train_one_epoch(epoch, model, train_loader, optimizer, criterion, device, wr
         running_loss += loss.item()
         pbar.set_postfix({"loss": loss.item()})
 
+        global_step = (epoch - 1) * len(train_loader) + batch_idx
         # ======================================================
         # -------------- TensorBoard Logging -------------------
         # ======================================================
         if writer is not None and batch_idx % 10 == 0:
+            global_step = (epoch - 1) * len(train_loader) + batch_idx
 
             # Per-component scalar logs
-            writer.add_scalar("loss/total", loss.item(), epoch * len(train_loader) + batch_idx)
-            writer.add_scalar("loss/pos_bce", extras["pos_bce"].item(), (epoch - 1) * len(train_loader) + batch_idx)
-            writer.add_scalar("loss/neg_bce", extras["neg_bce"].item(), (epoch - 1) * len(train_loader) + batch_idx)
-            writer.add_scalar("loss/pos_margin", extras["pos_margin"].item(), (epoch - 1) * len(train_loader) + batch_idx)
-            writer.add_scalar("loss/neg_margin", extras["neg_margin"].item(), (epoch - 1) * len(train_loader) + batch_idx)
+            writer.add_scalar("loss/total", loss.item(), global_step)
+            writer.add_scalar("loss/pos_bce", extras["pos_bce"].item(), global_step)
+            writer.add_scalar("loss/neg_bce", extras["neg_bce"].item(), global_step)
+            writer.add_scalar("loss/pos_margin", extras["pos_margin"].item(), global_step)
+            writer.add_scalar("loss/neg_margin", extras["neg_margin"].item(), global_step)
 
-            # β histogram
             with torch.no_grad():
-                beta_prob = torch.sigmoid(pred["beta"]).detach().cpu().flatten()
-                writer.add_histogram("beta_prob/all", beta_prob, (epoch - 1) * len(train_loader) + batch_idx)
-                writer.add_scalar("beta_prob/mean", beta_prob.mean().item(), (epoch - 1) * len(train_loader) + batch_idx)
+                # (B, N, 1) -> (B, N) -> (B*N,)
+                beta_prob = torch.sigmoid(pred["beta"]).squeeze(-1)      # (B, N)
+                beta_flat = beta_prob.detach().cpu().reshape(-1)         # (B*N,)
 
-            # CP count prediction at inference threshold 0.5
-            pred_cps = (beta_prob.numpy() > 0.5).sum()
-            writer.add_scalar("beta_prob/predicted_cp_count", pred_cps, (epoch - 1) * len(train_loader) + batch_idx)
+                writer.add_histogram("beta_prob/all", beta_flat, global_step)
+                writer.add_scalar("beta_prob/mean", beta_flat.mean().item(), global_step)
+
+                # Ground truth CP / non-CP / background masks
+                cp_flat    = (cp_labels.reshape(-1).cpu() == 1)
+                noncp_flat = (cp_labels.reshape(-1).cpu() == 0)
+                bg_flat    = (cp_labels.reshape(-1).cpu() == -1)
+
+                # True CP count
+                true_cp_count = cp_flat.sum().item()
+                writer.add_scalar("debug/true_cp_count", true_cp_count, global_step)
+
+                # Predicted CP count at threshold 0.5
+                pred_cp_count = (beta_flat > 0.5).sum().item()
+                writer.add_scalar("debug/pred_cp_count", pred_cp_count, global_step)
+
+                # Optional: separate histograms
+                if cp_flat.any():
+                    writer.add_histogram("beta_prob/cp_hits", beta_flat[cp_flat], global_step)
+                if noncp_flat.any():
+                    writer.add_histogram("beta_prob/noncp_hits", beta_flat[noncp_flat], global_step)
+                if bg_flat.any():
+                    writer.add_histogram("beta_prob/background", beta_flat[bg_flat], global_step)
 
     return running_loss / len(train_loader)
 
