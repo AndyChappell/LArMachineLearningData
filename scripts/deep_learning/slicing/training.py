@@ -1,17 +1,18 @@
 import os
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 from tqdm.auto import tqdm
 
 
-def train_one_epoch(model, train_loader, optimizer, criterion, device, scaler=None, max_grad_norm=1.0):
+def train_one_epoch(epoch, model, train_loader, optimizer, criterion, device, writer=None, scaler=None, max_grad_norm=1.0):
     model.train()
     running_loss = 0.0
 
     pbar = tqdm(train_loader, desc="[Train]", unit="batch")
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         hits = batch["hits"].to(device)                     # (B, N, F)
         slice_labels = batch["slice_labels"].to(device)     # (B, N)
         cp_labels = batch["cp_labels"].to(device)           # (B, N)
@@ -19,15 +20,15 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, scaler=No
         optimizer.zero_grad()
 
         # ----------------------------
-        # Forward (with AMP if enabled)
+        # Forward pass
         # ----------------------------
         if scaler is not None:
-            with autocast():
+            with autocast(device.type):
                 pred = model(hits)
-                loss = criterion(pred, slice_labels, cp_labels)
+                loss, extras = criterion(pred, slice_labels, cp_labels)
         else:
             pred = model(hits)
-            loss = criterion(pred, slice_labels, cp_labels)
+            loss, extras = criterion(pred, slice_labels, cp_labels)
 
         # ----------------------------
         # Backward
@@ -48,6 +49,28 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, scaler=No
         running_loss += loss.item()
         pbar.set_postfix({"loss": loss.item()})
 
+        # ======================================================
+        # -------------- TensorBoard Logging -------------------
+        # ======================================================
+        if writer is not None and batch_idx % 10 == 0:
+
+            # Per-component scalar logs
+            writer.add_scalar("loss/total", loss.item(), epoch * len(train_loader) + batch_idx)
+            writer.add_scalar("loss/pos_bce", extras["pos_bce"].item(), (epoch - 1) * len(train_loader) + batch_idx)
+            writer.add_scalar("loss/neg_bce", extras["neg_bce"].item(), (epoch - 1) * len(train_loader) + batch_idx)
+            writer.add_scalar("loss/pos_margin", extras["pos_margin"].item(), (epoch - 1) * len(train_loader) + batch_idx)
+            writer.add_scalar("loss/neg_margin", extras["neg_margin"].item(), (epoch - 1) * len(train_loader) + batch_idx)
+
+            # β histogram
+            with torch.no_grad():
+                beta_prob = torch.sigmoid(pred["beta"]).detach().cpu().flatten()
+                writer.add_histogram("beta_prob/all", beta_prob, (epoch - 1) * len(train_loader) + batch_idx)
+                writer.add_scalar("beta_prob/mean", beta_prob.mean().item(), (epoch - 1) * len(train_loader) + batch_idx)
+
+            # CP count prediction at inference threshold 0.5
+            pred_cps = (beta_prob.numpy() > 0.5).sum()
+            writer.add_scalar("beta_prob/predicted_cp_count", pred_cps, (epoch - 1) * len(train_loader) + batch_idx)
+
     return running_loss / len(train_loader)
 
 
@@ -64,7 +87,7 @@ def validate(model, val_loader, criterion, device):
         cp_labels = batch["cp_labels"].to(device)
 
         pred = model(hits)
-        loss = criterion(pred, slice_labels, cp_labels)
+        loss, extras = criterion(pred, slice_labels, cp_labels)
 
         running_loss += loss.item()
         pbar.set_postfix({"loss": loss.item()})
