@@ -4,21 +4,26 @@ import torch.nn.functional as F
 
 
 class ObjectCondensationLoss(nn.Module):
-    def __init__(self, attraction_weight=1.0, repulsion_weight=1.0, beta_positive_weight=1.0, beta_negative_weight=0.5):
+    def __init__(
+            self,
+            attraction_weight=1.0,
+            repulsion_weight=1.0,
+            beta_positive_weight=5.0,#1.0,
+            beta_negative_weight=0.5,
+            margin_weight=5.0,#1.0,
+            threshold=0.5,
+            margin=0.2#0.1
+        ):
         super().__init__()
         self.attraction_weight = attraction_weight
         self.repulsion_weight = repulsion_weight
         self.beta_positive_weight = beta_positive_weight
         self.beta_negative_weight = beta_negative_weight
+        self.margin_weight = margin_weight
+        self.threshold = threshold
+        self.margin = margin
 
     def forward(self, pred, slice_id, is_cp):
-        """
-        pred: {"beta": (B, N, 1), "embed": (B, N, D)}
-        slice_id: (B, N) long, -1 = background
-        is_cp: (B, N) bool (1 = condensation point)
-
-        Returns: scalar loss
-        """
         beta = pred["beta"].squeeze(-1)      # (B, N)
         embed = pred["embed"]                # (B, N, D)
         B, N, D = embed.shape
@@ -27,81 +32,105 @@ class ObjectCondensationLoss(nn.Module):
         count = 0
 
         for b in range(B):
-            sid = slice_id[b]               # (N)
-            cp_mask = is_cp[b].bool()       # (N)
-            beta_b = beta[b]                # (N,)
-            emb_b = embed[b]                # (N, D)
+            sid = slice_id[b]
+            cp_mask = is_cp[b].bool()
+            beta_b = beta[b]
+            emb_b = embed[b]
 
-            valid = sid >= 0                # ignore background hits
+            valid = sid >= 0
             if valid.sum() == 0:
                 continue
 
-            # ---------------------------------------
-            # 1. Identify condensation points
-            # ---------------------------------------
             cp_idx = torch.where(cp_mask & valid)[0]
             if len(cp_idx) == 0:
                 continue
 
-            # condensation point embeddings & beta
-            cp_emb = emb_b[cp_idx]          # (M, D)
-            cp_beta = beta_b[cp_idx]        # (M)
-            cp_sid  = sid[cp_idx]           # (M)
+            cp_emb = emb_b[cp_idx]
+            cp_beta = beta_b[cp_idx]
+            cp_sid  = sid[cp_idx]
 
-            # ---------------------------------------
-            # 2. β Loss
-            #    - positive CPs: beta  1
-            #    - all other hits (including background): beta 0
-            # ---------------------------------------
-            pos_beta_loss = F.binary_cross_entropy_with_logits(cp_beta, torch.ones_like(cp_beta), reduction="mean")
+            # -------------------------------------------------------
+            # (1) β BCE losses (same as before)
+            # -------------------------------------------------------
 
-            # non-CP = everything except is_cp
+            #pos_bce = F.binary_cross_entropy_with_logits(
+            #    cp_beta,
+            #    torch.ones_like(cp_beta),
+            #    reduction="mean"
+            #)
+
+            pos_bce = focal_bce(cp_beta, torch.ones_like(cp_beta), alpha=0.75, gamma=2.0)
+
             non_cp_mask = (~cp_mask)
-            neg_beta_loss = F.binary_cross_entropy_with_logits(beta_b[non_cp_mask], torch.zeros_like(beta_b[non_cp_mask]), reduction="mean") if non_cp_mask.sum() > 0 else 0.0
+            if non_cp_mask.sum() > 0:
+                neg_bce = focal_bce(beta_b[non_cp_mask], torch.zeros_like(beta_b[non_cp_mask]), alpha=0.25, gamma=2.0)
+                #neg_bce = F.binary_cross_entropy_with_logits(
+                #    beta_b[non_cp_mask],
+                #    torch.zeros_like(beta_b[non_cp_mask]),
+                #    reduction="mean"
+                #)
+            else:
+                neg_bce = 0.0
 
-            beta_loss = (self.beta_positive_weight * pos_beta_loss + self.beta_negative_weight * neg_beta_loss)
+            # -------------------------------------------------------
+            # (2) β margin-based hinge losses (new)
+            # -------------------------------------------------------
+            # convert logits to probabilities for threshold comparisons
+            beta_prob = torch.sigmoid(beta_b)
 
-            # ---------------------------------------
-            # 3. Attraction loss
-            #    - for each instance, hits are pulled toward its CP embedding
-            # ---------------------------------------
+            # positive: β > threshold + margin
+            pos_margin_loss = F.relu(
+                (self.threshold + self.margin) - beta_prob[cp_mask]
+            ).mean()
+
+            # negative: β < threshold - margin
+            if non_cp_mask.sum() > 0:
+                neg_margin_loss = F.relu(
+                    beta_prob[non_cp_mask] - (self.threshold - self.margin)
+                ).mean()
+            else:
+                neg_margin_loss = 0.0
+
+            beta_loss = (
+                self.beta_positive_weight * pos_bce +
+                self.beta_negative_weight * neg_bce +
+                self.margin_weight * (pos_margin_loss + neg_margin_loss)
+            )
+
+            # -------------------------------------------------------
+            # (3) Attraction loss (unchanged)
+            # -------------------------------------------------------
             attraction_loss = 0.0
-
             unique_ids = sid[valid].unique()
+
             for inst in unique_ids:
                 inst_mask = (sid == inst)
-
-                inst_hits = emb_b[inst_mask]               # (K, D)
-                inst_cp = emb_b[inst_mask & cp_mask]       # (1, D)
+                inst_hits = emb_b[inst_mask]
+                inst_cp = emb_b[inst_mask & cp_mask]
 
                 if inst_cp.numel() == 0:
                     continue
 
-                inst_cp = inst_cp[0]                       # (D,)
-
-                # squared L2 distance
+                inst_cp = inst_cp[0]
                 d2 = (inst_hits - inst_cp).pow(2).sum(dim=1)
                 attraction_loss += d2.mean()
 
-            attraction_loss = attraction_loss * self.attraction_weight
+            attraction_loss = self.attraction_weight * attraction_loss
 
-            # ---------------------------------------
-            # 4. Repulsion loss
-            #    - condensation points of different slices must repel
-            # ---------------------------------------
+            # -------------------------------------------------------
+            # (4) Repulsion loss (unchanged)
+            # -------------------------------------------------------
             repulsion_loss = 0.0
             M = len(cp_idx)
             if M > 1:
-                # pairwise distances between CP embeddings
                 diff = cp_emb.unsqueeze(1) - cp_emb.unsqueeze(0)
-                d2 = (diff ** 2).sum(dim=2)                 # (M, M)
-                repulsion_loss = torch.exp(-d2).mean()      # repel by minimizing exp(-d^2)
+                d2 = (diff ** 2).sum(dim=2)
+                repulsion_loss = torch.exp(-d2).mean()
+                repulsion_loss *= self.repulsion_weight
 
-                repulsion_loss = repulsion_loss * self.repulsion_weight
-
-            # ---------------------------------------
-            # Accumulate per-batch-element
-            # ---------------------------------------
+            # -------------------------------------------------------
+            # accumulate
+            # -------------------------------------------------------
             loss_b = beta_loss + attraction_loss + repulsion_loss
             total_loss += loss_b
             count += 1
@@ -109,4 +138,21 @@ class ObjectCondensationLoss(nn.Module):
         if count == 0:
             return torch.tensor(0.0, device=embed.device)
 
-        return total_loss / count
+        final_loss = total_loss / count
+
+        # diagnostics (CPU-safe scalar values)
+        extras = {
+            "pos_bce": pos_bce.detach(),
+            "neg_bce": neg_bce.detach() if isinstance(neg_bce, torch.Tensor) else torch.tensor(neg_bce),
+            "pos_margin": pos_margin_loss.detach(),
+            "neg_margin": neg_margin_loss.detach()
+        }
+
+        return final_loss, extras
+
+
+def focal_bce(logits, targets, alpha=0.75, gamma=2.0):
+    p = torch.sigmoid(logits)
+    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    pt = p * targets + (1 - p) * (1 - targets)
+    return (alpha * (1 - pt)**gamma * ce).mean()

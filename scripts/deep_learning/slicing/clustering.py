@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 
-def oc_cluster(beta, embed, beta_threshold=0.1, top_k_fallback=1):
+def oc_cluster(beta, embed, beta_threshold=0.5, top_k_fallback=1):
     """
     Perform Object Condensation clustering.
     Inputs:
