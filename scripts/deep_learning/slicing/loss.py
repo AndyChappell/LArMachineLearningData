@@ -52,54 +52,77 @@ class ObjectCondensationLoss(nn.Module):
                 continue
 
             # ===============================
-            # 1) β LOSS (This is the key update)
+            # 1) β loss (class-weighted BCE)
             # ===============================
-            labels = cp_mask.float()   # 1 for CP, 0 otherwise
-
-            # dynamic weighting
-            pos_weight    = (neg_count / (pos_count + 1e-6)).detach()
-            noncp_weight  = 1.0
-            bg_weight     = 2.0        # <- pushes background down harder
-
-            # create per-hit weight vector
+            labels = cp_mask.float()      # CP=1, everything else=0
+            beta_logits = beta_b
+            
+            pos_count = cp_mask.sum()
+            neg_count = noncp_mask.sum() + bg_mask.sum()
+            if pos_count < 1 or neg_count < 1:
+                continue
+            
+            pos_weight   = (neg_count / (pos_count + 1e-6)).detach()
+            noncp_weight = 1.0
+            bg_weight    = 2.0
+            
             weights = torch.zeros_like(labels)
             weights[cp_mask]    = pos_weight
             weights[noncp_mask] = noncp_weight
             weights[bg_mask]    = bg_weight
-
+            
             beta_ce = F.binary_cross_entropy_with_logits(
-                beta_b,
-                labels,
-                weight=weights,
-                reduction='mean'
+                beta_logits, labels, weight=weights, reduction='mean'
             )
+            
             beta_loss = beta_ce
-            beta_log += beta_loss.detach()
-
+            
+            
             # ===============================
             # 2) Attraction loss (unchanged)
             # ===============================
             attraction_loss = 0.0
             valid = sid >= 0
-            unique_ids = sid[valid].unique()
-
+            unique_ids = sid[valid].unique()     # <-- we define unique_ids here
+            
             for inst in unique_ids:
                 inst_mask = sid == inst
                 inst_hits = emb_b[inst_mask]
                 inst_cp   = emb_b[inst_mask & cp_mask]
-
-                if inst_cp.numel() == 0:
+                if inst_cp.numel() == 0: 
                     continue
-
+            
                 inst_cp = inst_cp[0]
                 d2 = (inst_hits - inst_cp).pow(2).sum(dim=1)
                 attraction_loss += d2.mean()
-
-            attraction_loss = self.attraction_weight * attraction_loss
-            attr_log += attraction_loss.detach()
-
+            
+            attraction_loss *= self.attraction_weight
+            
+            
             # ===============================
-            # 3) Repulsion loss (unchanged)
+            # 3) NEW: Ranking loss (adds CP > nonCP pressure)
+            # ===============================
+            ranking_loss = 0.0
+            margin = 0.3     # tunable; 0.2–0.5 good range
+            
+            for inst in unique_ids:
+                inst_mask    = (sid == inst)
+                cp_inst      = inst_mask & cp_mask
+                noncp_inst   = inst_mask & noncp_mask
+            
+                if cp_inst.sum()==1 and noncp_inst.sum()>0:
+                    beta_cp    = beta_b[cp_inst]      # scalar
+                    beta_ncp   = beta_b[noncp_inst]   # many
+            
+                    ranking_loss += F.relu(beta_ncp + margin - beta_cp).mean()
+            
+            ranking_loss = ranking_loss / max(len(unique_ids),1)
+            
+            beta_loss = beta_ce + 2.0*ranking_loss   # ← add ranking force
+            
+            
+            # ===============================
+            # 4) Repulsion loss (unchanged)
             # ===============================
             repulsion_loss = 0.0
             cp_idx = torch.where(cp_mask)[0]
@@ -108,13 +131,16 @@ class ObjectCondensationLoss(nn.Module):
                 diff = cp_emb.unsqueeze(1) - cp_emb.unsqueeze(0)
                 d2   = (diff**2).sum(dim=2)
                 repulsion_loss = torch.exp(-d2).mean() * self.repulsion_weight
-
-            repl_log += repulsion_loss.detach()
-
+            
+            
             # ===============================
-            # Accumulate total
+            # Total accumulation
             # ===============================
-            total_loss += (beta_loss + attraction_loss + repulsion_loss)
+            loss_b = beta_loss + attraction_loss + repulsion_loss
+            total_loss += loss_b
+            beta_log   += beta_loss.detach()
+            attr_log   += attraction_loss.detach()
+            repl_log   += repulsion_loss.detach()
             count += 1
 
         if count == 0:
