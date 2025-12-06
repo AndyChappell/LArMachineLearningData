@@ -58,10 +58,9 @@ def train_one_epoch(epoch, model, train_loader, optimizer, criterion, device, wr
 
             # Per-component scalar logs
             writer.add_scalar("loss/total", loss.item(), global_step)
-            writer.add_scalar("loss/pos_bce", extras["pos_bce"].item(), global_step)
-            writer.add_scalar("loss/neg_bce", extras["neg_bce"].item(), global_step)
-            writer.add_scalar("loss/pos_margin", extras["pos_margin"].item(), global_step)
-            writer.add_scalar("loss/neg_margin", extras["neg_margin"].item(), global_step)
+            writer.add_scalar("loss/beta_loss", extras["beta_loss"].item(), global_step)
+            writer.add_scalar("loss/attr_loss", extras["attr_loss"].item(), global_step)
+            writer.add_scalar("loss/repl_loss", extras["repl_loss"].item(), global_step)
 
             with torch.no_grad():
                 # (B, N, 1) -> (B, N) -> (B*N,)

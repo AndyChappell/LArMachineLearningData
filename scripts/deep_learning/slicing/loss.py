@@ -31,115 +31,62 @@ class ObjectCondensationLoss(nn.Module):
         B, N, D = embed.shape
 
         total_loss = 0.0
+        beta_log = 0.0
+        attr_log = 0.0
+        repl_log = 0.0
         count = 0
 
         for b in range(B):
-            sid = slice_id[b]
-            cp_mask = is_cp[b].bool()
-            beta_b = beta[b]
-            emb_b = embed[b]
+            sid = slice_id[b]     # (N,)
+            cp_mask    = (is_cp[b] == 1)          # condensation points
+            noncp_mask = (sid >= 0) & (~cp_mask)  # foreground non-CP
+            bg_mask    = (sid < 0)                # background hits
 
-            valid = sid >= 0
-            if valid.sum() == 0:
+            beta_b = beta[b]      # logits (N,)
+            emb_b  = embed[b]     # embeddings (N,D)
+
+            # --- Skip if no usable hits ---
+            pos_count = cp_mask.sum()
+            neg_count = noncp_mask.sum() + bg_mask.sum()
+            if pos_count < 1 or neg_count < 1:
                 continue
 
-            cp_idx = torch.where(cp_mask & valid)[0]
-            if len(cp_idx) == 0:
-                continue
+            # ===============================
+            # 1) β LOSS (This is the key update)
+            # ===============================
+            labels = cp_mask.float()   # 1 for CP, 0 otherwise
 
-            cp_emb = emb_b[cp_idx]
-            cp_beta = beta_b[cp_idx]
-            cp_sid  = sid[cp_idx]
+            # dynamic weighting
+            pos_weight    = (neg_count / (pos_count + 1e-6)).detach()
+            noncp_weight  = 1.0
+            bg_weight     = 2.0        # <- pushes background down harder
 
-            # -------------------------------------------------------
-            # (1) β BCE losses (same as before)
-            # -------------------------------------------------------
+            # create per-hit weight vector
+            weights = torch.zeros_like(labels)
+            weights[cp_mask]    = pos_weight
+            weights[noncp_mask] = noncp_weight
+            weights[bg_mask]    = bg_weight
 
-            #pos_bce = F.binary_cross_entropy_with_logits(
-            #    cp_beta,
-            #    torch.ones_like(cp_beta),
-            #    reduction="mean"
-            #)
-
-            #pos_bce = focal_bce(cp_beta, torch.ones_like(cp_beta), alpha=0.75, gamma=2.0)
-            pos_bce_accum = 0.0
-            total_w = 0.0
-            
-            unique_ids = sid[valid].unique()
-            for inst in unique_ids:
-                inst_mask = (sid == inst)
-                inst_cp_mask = inst_mask & cp_mask
-            
-                if inst_cp_mask.sum() == 0:
-                    continue
-            
-                inst_size = inst_mask.sum().float()         # number of hits in slice
-                inst_cp_beta = beta_b[inst_cp_mask]
-                inst_loss = focal_bce(inst_cp_beta, torch.ones_like(inst_cp_beta), alpha=0.75, gamma=2.0)
-            
-                pos_bce_accum += inst_size * inst_loss       # CP represents full instance
-                total_w += inst_size
-            
-            pos_bce = pos_bce_accum / total_w            
-
-            non_cp_mask = (~cp_mask)
-            if non_cp_mask.sum() > 0:
-                neg_bce = F.binary_cross_entropy_with_logits(
-                    beta_b[non_cp_mask],
-                    torch.zeros_like(beta_b[non_cp_mask]),
-                    reduction="mean"
-                )
-            else:
-                neg_bce = 0.0
-
-            # -------------------------------------------------------
-            # (2) β margin-based hinge losses (new)
-            # -------------------------------------------------------
-            # convert logits to probabilities for threshold comparisons
-            beta_prob = torch.sigmoid(beta_b)
-
-            # positive: β > threshold + margin
-            pos_margin_loss = F.relu(
-                (self.threshold + self.margin) - beta_prob[cp_mask]
-            ).mean()
-
-            # negative: β < threshold - margin
-            if non_cp_mask.sum() > 0:
-                neg_margin_loss = F.relu(
-                    beta_prob[non_cp_mask] - (self.threshold - self.margin)
-                ).mean()
-            else:
-                neg_margin_loss = 0.0
-
-            # Background suppression
-            bg_mask = (sid == -1)
-
-            if bg_mask.sum() > 0:
-                bg_bce = F.binary_cross_entropy_with_logits(
-                    beta_b[bg_mask],
-                    torch.zeros_like(beta_b[bg_mask]),
-                    reduction="mean"
-                )
-            else:
-                bg_bce = 0.0
-
-            beta_loss = (
-                self.beta_positive_weight * pos_bce +
-                self.beta_negative_weight_signal * neg_bce +
-                self.beta_negative_weight_background * bg_bce +
-                self.margin_weight * (pos_margin_loss + neg_margin_loss)
+            beta_ce = F.binary_cross_entropy_with_logits(
+                beta_b,
+                labels,
+                weight=weights,
+                reduction='mean'
             )
+            beta_loss = beta_ce
+            beta_log += beta_loss.detach()
 
-            # -------------------------------------------------------
-            # (3) Attraction loss (unchanged)
-            # -------------------------------------------------------
+            # ===============================
+            # 2) Attraction loss (unchanged)
+            # ===============================
             attraction_loss = 0.0
+            valid = sid >= 0
             unique_ids = sid[valid].unique()
 
             for inst in unique_ids:
-                inst_mask = (sid == inst)
+                inst_mask = sid == inst
                 inst_hits = emb_b[inst_mask]
-                inst_cp = emb_b[inst_mask & cp_mask]
+                inst_cp   = emb_b[inst_mask & cp_mask]
 
                 if inst_cp.numel() == 0:
                     continue
@@ -149,36 +96,36 @@ class ObjectCondensationLoss(nn.Module):
                 attraction_loss += d2.mean()
 
             attraction_loss = self.attraction_weight * attraction_loss
+            attr_log += attraction_loss.detach()
 
-            # -------------------------------------------------------
-            # (4) Repulsion loss (unchanged)
-            # -------------------------------------------------------
+            # ===============================
+            # 3) Repulsion loss (unchanged)
+            # ===============================
             repulsion_loss = 0.0
-            M = len(cp_idx)
-            if M > 1:
+            cp_idx = torch.where(cp_mask)[0]
+            if len(cp_idx) > 1:
+                cp_emb = emb_b[cp_idx]
                 diff = cp_emb.unsqueeze(1) - cp_emb.unsqueeze(0)
-                d2 = (diff ** 2).sum(dim=2)
-                repulsion_loss = torch.exp(-d2).mean()
-                repulsion_loss *= self.repulsion_weight
+                d2   = (diff**2).sum(dim=2)
+                repulsion_loss = torch.exp(-d2).mean() * self.repulsion_weight
 
-            # -------------------------------------------------------
-            # accumulate
-            # -------------------------------------------------------
-            loss_b = beta_loss + attraction_loss + repulsion_loss
-            total_loss += loss_b
+            repl_log += repulsion_loss.detach()
+
+            # ===============================
+            # Accumulate total
+            # ===============================
+            total_loss += (beta_loss + attraction_loss + repulsion_loss)
             count += 1
 
         if count == 0:
-            return torch.tensor(0.0, device=embed.device)
+            return torch.tensor(0.0, device=embed.device), {}
 
         final_loss = total_loss / count
 
-        # diagnostics (CPU-safe scalar values)
         extras = {
-            "pos_bce": pos_bce.detach(),
-            "neg_bce": neg_bce.detach() if isinstance(neg_bce, torch.Tensor) else torch.tensor(neg_bce),
-            "pos_margin": pos_margin_loss.detach(),
-            "neg_margin": neg_margin_loss.detach()
+            "beta_loss": beta_log / count,
+            "attr_loss": attr_log / count,
+            "repl_loss": repl_log / count
         }
 
         return final_loss, extras
