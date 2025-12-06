@@ -8,17 +8,19 @@ class ObjectCondensationLoss(nn.Module):
             self,
             attraction_weight=1.0,
             repulsion_weight=1.0,
-            beta_positive_weight=5.0,#1.0,
-            beta_negative_weight=3.0,#0.5,
-            margin_weight=5.0,#1.0,
+            beta_positive_weight=10.0,#1.0,
+            beta_negative_weight_signal=3.0,#0.5,
+            beta_negative_weight_background=6.0,#0.5,
+            margin_weight=10.0,#1.0,
             threshold=0.5,
-            margin=0.2#0.1
+            margin=0.3#0.1
         ):
         super().__init__()
         self.attraction_weight = attraction_weight
         self.repulsion_weight = repulsion_weight
         self.beta_positive_weight = beta_positive_weight
-        self.beta_negative_weight = beta_negative_weight
+        self.beta_negative_weight_signal = beta_negative_weight_signal
+        self.beta_negative_weight_background = beta_negative_weight_background
         self.margin_weight = margin_weight
         self.threshold = threshold
         self.margin = margin
@@ -59,7 +61,26 @@ class ObjectCondensationLoss(nn.Module):
             #    reduction="mean"
             #)
 
-            pos_bce = focal_bce(cp_beta, torch.ones_like(cp_beta), alpha=0.75, gamma=2.0)
+            #pos_bce = focal_bce(cp_beta, torch.ones_like(cp_beta), alpha=0.75, gamma=2.0)
+            pos_bce_accum = 0.0
+            total_w = 0.0
+            
+            unique_ids = sid[valid].unique()
+            for inst in unique_ids:
+                inst_mask = (sid == inst)
+                inst_cp_mask = inst_mask & cp_mask
+            
+                if inst_cp_mask.sum() == 0:
+                    continue
+            
+                inst_size = inst_mask.sum().float()         # number of hits in slice
+                inst_cp_beta = beta_b[inst_cp_mask]
+                inst_loss = focal_bce(inst_cp_beta, torch.ones_like(inst_cp_beta), alpha=0.75, gamma=2.0)
+            
+                pos_bce_accum += inst_size * inst_loss       # CP represents full instance
+                total_w += inst_size
+            
+            pos_bce = pos_bce_accum / total_w            
 
             non_cp_mask = (~cp_mask)
             if non_cp_mask.sum() > 0:
@@ -90,9 +111,22 @@ class ObjectCondensationLoss(nn.Module):
             else:
                 neg_margin_loss = 0.0
 
+            # Background suppression
+            bg_mask = (sid == -1)
+
+            if bg_mask.sum() > 0:
+                bg_bce = F.binary_cross_entropy_with_logits(
+                    beta_b[bg_mask],
+                    torch.zeros_like(beta_b[bg_mask]),
+                    reduction="mean"
+                )
+            else:
+                bg_bce = 0.0
+
             beta_loss = (
                 self.beta_positive_weight * pos_bce +
-                self.beta_negative_weight * neg_bce +
+                self.beta_negative_weight_signal * neg_bce +
+                self.beta_negative_weight_background * bg_bce +
                 self.margin_weight * (pos_margin_loss + neg_margin_loss)
             )
 
