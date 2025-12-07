@@ -61,6 +61,10 @@ def train_one_epoch(epoch, model, train_loader, optimizer, criterion, device, wr
             writer.add_scalar("loss/beta_loss", extras["beta_loss"].item(), global_step)
             writer.add_scalar("loss/attr_loss", extras["attr_loss"].item(), global_step)
             writer.add_scalar("loss/repl_loss", extras["repl_loss"].item(), global_step)
+            writer.add_scalar("loss/beta_ce", extras["beta_ce"].item(), global_step)
+            writer.add_scalar("loss/rank_loss", extras["rank_loss"].item(), global_step)
+            writer.add_scalar("loss/cp_elev", extras["cp_elev"].item(), global_step)
+            writer.add_scalar("loss/ncp_supp", extras["ncp_supp"].item(), global_step)
 
             with torch.no_grad():
                 # (B, N, 1) -> (B, N) -> (B*N,)
