@@ -1,5 +1,34 @@
-import torch, torch.nn as nn, torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+
+# ==========================================================
+# 1. KNN geometric context features
+# ==========================================================
+def knn_geometry_features(coords, k=8):
+    """
+    coords: (B, N, 2) = (x,z)
+    returns:
+        mean_dist   (B,N,1)
+        density     (B,N,1)
+    """
+    # Compute pairwise distances (B,N,N)
+    dist = torch.cdist(coords, coords)
+
+    # Get k nearest neighbors (exclude self => topk takes 0==self but fine)
+    knn = dist.topk(k, largest=False).values        # (B,N,k)
+
+    mean_dist = knn.mean(dim=-1, keepdim=True)      # (B,N,1)
+    density   = 1.0 / (mean_dist + 1e-6)            # (B,N,1)
+
+    return mean_dist, density
+
+
+
+# ==========================================================
+# Flash attention blocks (same as before)
+# ==========================================================
 class FlashMHA(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.0):
         super().__init__()
@@ -11,82 +40,83 @@ class FlashMHA(nn.Module):
         self.dropout = dropout
 
     def forward(self, x):
-        """
-        Mask-free forward. Do NOT pass a key_padding_mask here if you want FlashAttention fast path.
-        x: (B, N, C)
-        """
         B, N, C = x.shape
-        qkv = self.qkv_proj(x)                                    # (B, N, 3*C)
-        qkv = qkv.view(B, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)                          # (3, B, heads, N, head_dim)
-        q, k, v = qkv[0], qkv[1], qkv[2]                          # each (B, heads, N, head_dim)
+        qkv = self.qkv_proj(x).view(B,N,3,self.num_heads,self.head_dim).permute(2,0,3,1,4)
+        q,k,v = qkv[0], qkv[1], qkv[2]
 
-        if not torch.jit.is_scripting() and x.device.type == "cuda":
-            # Fast path: no attn mask / key_padding_mask passed
+        if x.device.type=="cuda":
             out = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=False
-            )  # (B*heads, N, head_dim) or fused output shaped to (B, heads, N, head_dim)
+                q,k,v,
+                dropout_p=self.dropout if self.training else 0.0
+            )
         else:
-            # CPU fallback: regular attention - needed for LibTorch
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-            attn_probs = torch.softmax(attn_scores, dim=-1)
-            out = torch.matmul(attn_probs, v)
+            attn = torch.softmax((q @ k.transpose(-2,-1))/self.head_dim**0.5, dim=-1)
+            out = attn @ v
 
-        out = out.view(B, self.num_heads, N, self.head_dim).permute(0, 2, 1, 3).reshape(B, N, C)
-        return self.o_proj(out)
+        return self.o_proj(out.permute(0,2,1,3).contiguous().view(B,N,C))
+
 
 
 class FlashTransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = FlashMHA(embed_dim, num_heads, dropout)
+        self.attn  = FlashMHA(embed_dim, num_heads, dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, ff_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, embed_dim),
+        self.ffn   = nn.Sequential(
+            nn.Linear(embed_dim, ff_dim), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(ff_dim, embed_dim)
         )
-
-    def forward(self, x):
-        # No key_padding_mask forwarded here — attention runs on full sequence (including pads)
+    def forward(self,x):
         x = x + self.attn(self.norm1(x))
         x = x + self.ffn(self.norm2(x))
         return x
 
 
+# ==========================================================
+# Object Condensation Model w/ KNN geometry
+# ==========================================================
 class ObjectCondensationNet(nn.Module):
-    def __init__(self, input_dim, embed_dim, num_heads, num_layers, ff_dim, num_classes, dropout=0.1):
+    def __init__(self, input_dim, embed_dim, num_heads, num_layers, ff_dim,
+                 dropout=0.1, knn_k=8):
+        """
+        input_dim = original hit feature count (x,z,v,...)
+        extra 2 features added: mean_knn_dist, density
+        new_input_dim = input_dim + 2
+        """
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, embed_dim)
+
+        self.knn_k = knn_k
+        total_in = input_dim + 2                         # + mean_dist + density
+
+        self.input_proj = nn.Linear(total_in, embed_dim)
+
         self.layers = nn.ModuleList([
-            FlashTransformerBlock(embed_dim, num_heads, ff_dim, dropout)
+            FlashTransformerBlock(embed_dim,num_heads,ff_dim,dropout)
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(embed_dim)
 
-        # OC heads
-        # beta is a scalar indicating if a token is a condensation point
-        self.beta_head = nn.Linear(embed_dim, 1)
-        # embed is a vector such that tokens from the same instance should have similar embedding, and
-        # tokens from separate instances should have a dissimilar embedding
+        self.beta_head  = nn.Linear(embed_dim, 1)
         self.embed_head = nn.Linear(embed_dim, embed_dim)
-        
+
 
     def forward(self, hits):
         """
-        hits: (B, N, F)
-        NOTE: mask is intentionally NOT passed through. Keep mask only for loss/metrics.
+        hits: (B,N,F) — must contain x=hits[...,0], z=hits[...,1]
         """
-        x = self.input_proj(hits)
+
+        coords = hits[...,:2]                        # (B,N,2)
+
+        mean_dist, density = knn_geometry_features(coords, k=self.knn_k)
+
+        # augment features
+        hits_aug = torch.cat([hits, mean_dist, density], dim=-1)
+
+        x = self.input_proj(hits_aug)
+
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x)
 
-        beta = self.beta_head(x)             # (B, N, 1)
-        embed = self.embed_head(x)           # (B, N, D)
-
-        return {"beta": beta, "embed": embed}
+        return {"beta": self.beta_head(x), "embed": self.embed_head(x)}

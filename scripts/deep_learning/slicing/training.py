@@ -6,96 +6,73 @@ from torch.amp import autocast
 from tqdm.auto import tqdm
 
 
-def train_one_epoch(epoch, model, train_loader, optimizer, criterion, device, writer=None, scaler=None, max_grad_norm=1.0):
+def train_one_epoch(epoch, model, train_loader, optimizer, criterion,
+                    device, writer=None, scaler=None, max_grad_norm=1.0):
     model.train()
     running_loss = 0.0
 
-    pbar = tqdm(train_loader, desc="[Train]", unit="batch")
+    pbar = tqdm(train_loader, desc=f"[Train {epoch}]", unit="batch")
 
     for batch_idx, batch in enumerate(pbar):
-        hits = batch["hits"].to(device)                     # (B, N, F)
-        slice_labels = batch["slice_labels"].to(device)     # (B, N)
-        cp_labels = batch["cp_labels"].to(device)           # (B, N)
+
+        hits = batch["hits"].to(device)            # (B,N,F)
+        slice_labels = batch["slice_labels"].to(device)
+        cp_labels = batch["cp_labels"].to(device)
+        is_cp = (cp_labels == 1).long()            # convert to 0/1 mask
 
         optimizer.zero_grad()
 
-        # ----------------------------
-        # Forward pass
-        # ----------------------------
-        if scaler is not None:
-            with autocast(device.type):
+        # forward
+        if scaler:
+            with autocast(device_type=device.type):
                 pred = model(hits)
-                loss, extras = criterion(pred, slice_labels, cp_labels)
+                loss,extras = criterion(pred,slice_labels,is_cp)
         else:
             pred = model(hits)
-            loss, extras = criterion(pred, slice_labels, cp_labels)
+            loss,extras = criterion(pred,slice_labels,is_cp)
 
-        # ----------------------------
-        # Backward
-        # ----------------------------
-        if scaler is not None:
+        # backward
+        if scaler:
             scaler.scale(loss).backward()
-            if max_grad_norm is not None:
+            if max_grad_norm:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
+                torch.nn.utils.clip_grad_norm_(model.parameters(),max_grad_norm)
+            scaler.step(optimizer); scaler.update()
         else:
             loss.backward()
-            if max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            if max_grad_norm:
+                torch.nn.utils.clip_grad_norm_(model.parameters(),max_grad_norm)
             optimizer.step()
 
         running_loss += loss.item()
-        pbar.set_postfix({"loss": loss.item()})
+        pbar.set_postfix(loss=loss.item())
 
-        global_step = (epoch - 1) * len(train_loader) + batch_idx
-        # ======================================================
-        # -------------- TensorBoard Logging -------------------
-        # ======================================================
-        if writer is not None and batch_idx % 10 == 0:
-            global_step = (epoch - 1) * len(train_loader) + batch_idx
 
-            # Per-component scalar logs
-            writer.add_scalar("loss/total", loss.item(), global_step)
-            writer.add_scalar("loss/beta_loss", extras["beta_loss"].item(), global_step)
-            writer.add_scalar("loss/attr_loss", extras["attr_loss"].item(), global_step)
-            writer.add_scalar("loss/repl_loss", extras["repl_loss"].item(), global_step)
-            writer.add_scalar("loss/beta_ce", extras["beta_ce"].item(), global_step)
-            writer.add_scalar("loss/rank_loss", extras["rank_loss"].item(), global_step)
-            writer.add_scalar("loss/cp_elev", extras["cp_elev"].item(), global_step)
-            writer.add_scalar("loss/ncp_supp", extras["ncp_supp"].item(), global_step)
+        # ---------------- TB logging every 10 steps -----------------
+        if writer and batch_idx % 10 == 0:
+            step = (epoch-1)*len(train_loader) + batch_idx
+
+            writer.add_scalar("loss/total",loss.item(),step)
+            for k,v in extras.items():
+                writer.add_scalar(f"loss/{k}",v.item(),step)
 
             with torch.no_grad():
-                # (B, N, 1) -> (B, N) -> (B*N,)
-                beta_prob = torch.sigmoid(pred["beta"]).squeeze(-1)      # (B, N)
-                beta_flat = beta_prob.detach().cpu().reshape(-1)         # (B*N,)
+                beta_prob = torch.sigmoid(pred["beta"]).squeeze(-1)     # (B,N)
+                beta_flat = beta_prob.cpu().flatten()
+                writer.add_histogram("beta/all",beta_flat,step)
 
-                writer.add_histogram("beta_prob/all", beta_flat, global_step)
-                writer.add_scalar("beta_prob/mean", beta_flat.mean().item(), global_step)
+                cp = (cp_labels.cpu().flatten()==1)
+                noncp = (cp_labels.cpu().flatten()==0)
+                bg = (cp_labels.cpu().flatten()==-1)
 
-                # Ground truth CP / non-CP / background masks
-                cp_flat    = (cp_labels.reshape(-1).cpu() == 1)
-                noncp_flat = (cp_labels.reshape(-1).cpu() == 0)
-                bg_flat    = (cp_labels.reshape(-1).cpu() == -1)
+                if cp.any(): writer.add_histogram("beta/cp",beta_flat[cp],step)
+                if noncp.any(): writer.add_histogram("beta/noncp",beta_flat[noncp],step)
+                if bg.any(): writer.add_histogram("beta/bg",beta_flat[bg],step)
 
-                # True CP count
-                true_cp_count = cp_flat.sum().item()
-                writer.add_scalar("debug/true_cp_count", true_cp_count, global_step)
+                writer.add_scalar("debug/pred_cp_count",(beta_flat>0.5).sum().item(),step)
+                writer.add_scalar("debug/true_cp_count",cp.sum().item(),step)
 
-                # Predicted CP count at threshold 0.5
-                pred_cp_count = (beta_flat > 0.5).sum().item()
-                writer.add_scalar("debug/pred_cp_count", pred_cp_count, global_step)
-
-                # Optional: separate histograms
-                if cp_flat.any():
-                    writer.add_histogram("beta_prob/cp_hits", beta_flat[cp_flat], global_step)
-                if noncp_flat.any():
-                    writer.add_histogram("beta_prob/noncp_hits", beta_flat[noncp_flat], global_step)
-                if bg_flat.any():
-                    writer.add_histogram("beta_prob/background", beta_flat[bg_flat], global_step)
-
-    return running_loss / len(train_loader)
+    return running_loss/len(train_loader)
 
 
 @torch.no_grad()

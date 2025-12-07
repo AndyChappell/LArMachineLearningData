@@ -4,174 +4,107 @@ import torch.nn.functional as F
 
 
 class ObjectCondensationLoss(nn.Module):
-    def __init__(
-            self,
-            attraction_weight=1.0,
-            repulsion_weight=1.0,
-            beta_positive_weight=10.0,#1.0,
-            beta_negative_weight_signal=3.0,#0.5,
-            beta_negative_weight_background=6.0,#0.5,
-            margin_weight=10.0,#1.0,
-            threshold=0.5,
-            margin=0.4#0.1
-        ):
+    def __init__(self, attraction_weight=1.0, repulsion_weight=1.0, bg_weight=2.0):
         super().__init__()
         self.attraction_weight = attraction_weight
-        self.repulsion_weight = repulsion_weight
-        self.beta_positive_weight = beta_positive_weight
-        self.beta_negative_weight_signal = beta_negative_weight_signal
-        self.beta_negative_weight_background = beta_negative_weight_background
-        self.margin_weight = margin_weight
-        self.threshold = threshold
-        self.margin = margin
+        self.repulsion_weight  = repulsion_weight
+        self.bg_weight = bg_weight    # can tune later (start ~2)
 
     def forward(self, pred, slice_id, is_cp):
-        beta = pred["beta"].squeeze(-1)      # (B, N)
-        embed = pred["embed"]                # (B, N, D)
-        B, N, D = embed.shape
+        beta  = pred["beta"].squeeze(-1)   # (B,N)
+        embed = pred["embed"]             # (B,N,D)
 
-        total_loss = 0.0
-        beta_log = 0.0
-        attr_log = 0.0
-        repl_log = 0.0
-        rank_log = 0.0
-        elev_log = 0.0
-        supp_log = 0.0
+        total_loss = beta_log = attr_log = repl_log = 0.0
         count = 0
 
+        B,N,_ = embed.shape
+
         for b in range(B):
-            sid = slice_id[b]     # (N,)
-            cp_mask    = (is_cp[b] == 1)          # condensation points
-            noncp_mask = (sid >= 0) & (~cp_mask)  # foreground non-CP
-            bg_mask    = (sid < 0)                # background hits
+            sid  = slice_id[b]            # (N,)
+            cp_mask = (is_cp[b] == 1)     # CP hits
+            bg_mask = (sid < 0)           # background
+            fg_mask = (sid >= 0)
 
-            beta_b = beta[b]      # logits (N,)
-            emb_b  = embed[b]     # embeddings (N,D)
+            beta_b = beta[b]
+            emb_b  = embed[b]
 
-            # --- Skip if no usable hits ---
-            pos_count = cp_mask.sum()
-            neg_count = noncp_mask.sum() + bg_mask.sum()
-            if pos_count < 1 or neg_count < 1:
-                continue
+            # ---- must define unique ids early ----
+            unique_ids = sid[fg_mask].unique()
 
-            # ===============================
-            # 1) β loss (class-weighted BCE)
-            # ===============================
-            labels = cp_mask.float()      # CP=1, everything else=0
-            beta_logits = beta_b
-
-            pos_count = cp_mask.sum()
-            neg_count = noncp_mask.sum() + bg_mask.sum()
-            if pos_count < 1 or neg_count < 1:
-                continue
-
-            pos_weight   = (neg_count / (pos_count + 1e-6)).detach()
-            noncp_weight = 1.0
-            bg_weight    = 2.0
-
-            weights = torch.zeros_like(labels)
-            weights[cp_mask]    = pos_weight
-            weights[noncp_mask] = noncp_weight
-            weights[bg_mask]    = bg_weight
-
-            beta_ce = F.binary_cross_entropy_with_logits(
-                beta_logits, labels, weight=weights, reduction='mean'
-            )
-
-            beta_loss = beta_ce
-
-            # ===============================
-            # 2) Attraction loss
-            # ===============================
-            attraction_loss = 0.0
-            valid = sid >= 0
-            unique_ids = sid[valid].unique()     # <-- we define unique_ids here
+            # ============================
+            # Slice-softmax CP classification
+            # ============================
+            beta_loss = 0.0
+            slice_count = 0
 
             for inst in unique_ids:
-                inst_mask = sid == inst
-                inst_hits = emb_b[inst_mask]
-                inst_cp   = emb_b[inst_mask & cp_mask]
-                if inst_cp.numel() == 0: 
+                inst_mask = (sid == inst)
+                cp_inst   = inst_mask & cp_mask
+                if cp_inst.sum() != 1: 
                     continue
 
+                inst_idx = torch.where(inst_mask)[0]
+                cp_idx   = torch.where(cp_inst)[0][0]
+
+                logits = beta_b[inst_idx].unsqueeze(0)  # (1,K)
+                target = (inst_idx == cp_idx).nonzero(as_tuple=True)[0]  # (1,)
+
+                beta_loss += F.cross_entropy(logits, target)
+                slice_count += 1
+
+            if slice_count == 0:
+                continue
+
+            beta_loss /= slice_count
+
+            # ============================
+            # Background suppression
+            # ============================
+            if bg_mask.any():
+                bg_beta = torch.sigmoid(beta_b[bg_mask])
+                beta_loss += self.bg_weight * bg_beta.mean()
+
+            # ============================
+            # Attraction loss
+            # ============================
+            attraction_loss = 0.0
+            for inst in unique_ids:
+                inst_mask = (sid == inst)
+                inst_hits = emb_b[inst_mask]
+                inst_cp   = emb_b[inst_mask & cp_mask]
+                if inst_cp.numel()==0: continue
                 inst_cp = inst_cp[0]
-                d2 = (inst_hits - inst_cp).pow(2).sum(dim=1)
-                attraction_loss += d2.mean()
+                attraction_loss += ((inst_hits-inst_cp)**2).sum(dim=1).mean()
 
             attraction_loss *= self.attraction_weight
 
-            # ===============================
-            # 3) Ranking loss (adds CP > nonCP pressure)
-            # ===============================
-            ranking_loss = 0.0
-            margin = 0.3     # tunable; 0.2–0.5 good range
-
-            for inst in unique_ids:
-                inst_mask    = (sid == inst)
-                cp_inst      = inst_mask & cp_mask
-                noncp_inst   = inst_mask & noncp_mask
-
-                if cp_inst.sum()==1 and noncp_inst.sum()>0:
-                    beta_cp    = beta_b[cp_inst]      # scalar
-                    beta_ncp   = beta_b[noncp_inst]   # many
-                    ranking_loss += F.relu(beta_ncp + margin - beta_cp).mean()
-
-            ranking_loss = ranking_loss / max(len(unique_ids),1)
-            cp_elevation = (1 - torch.sigmoid(beta_b[cp_mask])).mean()
-            noncp_suppression = torch.sigmoid(beta_b[noncp_mask]).mean()
-
-            beta_loss = (
-                beta_ce
-                + 4.0 * ranking_loss
-                + 1.0 * cp_elevation
-                + 2.0 * noncp_suppression
-            )
-
-            # ===============================
-            # 4) Repulsion loss (unchanged)
-            # ===============================
-            repulsion_loss = 0.0
+            # ============================
+            # Repulsion loss
+            # ============================
             cp_idx = torch.where(cp_mask)[0]
-            if len(cp_idx) > 1:
+            repulsion_loss = 0.0
+            if len(cp_idx)>1:
                 cp_emb = emb_b[cp_idx]
-                diff = cp_emb.unsqueeze(1) - cp_emb.unsqueeze(0)
-                d2   = (diff**2).sum(dim=2)
-                repulsion_loss = torch.exp(-d2).mean() * self.repulsion_weight
+                diff = cp_emb.unsqueeze(1)-cp_emb.unsqueeze(0)
+                dist2= (diff**2).sum(dim=2)
+                repulsion_loss = torch.exp(-dist2).mean()*self.repulsion_weight
 
-            # ===============================
-            # Total accumulation
-            # ===============================
-            loss_b = beta_loss + attraction_loss + repulsion_loss
+            # ============================
+            # Accumulate
+            # ============================
+            loss_b = beta_loss+attraction_loss+repulsion_loss
             total_loss += loss_b
             beta_log   += beta_loss.detach()
             attr_log   += attraction_loss.detach()
             repl_log   += repulsion_loss.detach()
-            rank_log   += ranking_loss.detach()
-            elev_log   += cp_elevation.detach()
-            supp_log   += noncp_suppression.detach()
-            
-            count += 1
+            count+=1
 
-        if count == 0:
-            return torch.tensor(0.0, device=embed.device), {}
+        if count==0:
+            return torch.tensor(0.,device=beta.device), {}
 
-        final_loss = total_loss / count
-
-        extras = {
-            "beta_loss": beta_log / count,
-            "attr_loss": attr_log / count,
-            "repl_loss": repl_log / count,
-            "beta_ce": beta_ce / count,
-            "rank_loss": rank_log / count,
-            "cp_elev": elev_log / count,
-            "ncp_supp": supp_log / count
+        return total_loss/count, {
+            "beta_loss": beta_log/count,
+            "attr_loss": attr_log/count,
+            "repl_loss": repl_log/count
         }
 
-        return final_loss, extras
-
-
-def focal_bce(logits, targets, alpha=0.75, gamma=2.0):
-    p = torch.sigmoid(logits)
-    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-    pt = p * targets + (1 - p) * (1 - targets)
-    return (alpha * (1 - pt)**gamma * ce).mean()
