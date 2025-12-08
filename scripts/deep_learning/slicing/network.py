@@ -59,21 +59,28 @@ class FlashTransformerBlock(nn.Module):
 
 
 class ObjectCondensationNet(nn.Module):
-    def __init__(self, input_dim, embed_dim, num_heads, num_layers, ff_dim, num_classes, dropout=0.1):
+    def __init__(self, input_dim, embed_dim, num_heads, num_layers, ff_dim, dropout=0.1):
         super().__init__()
+
         self.input_proj = nn.Linear(input_dim, embed_dim)
+
         self.layers = nn.ModuleList([
             FlashTransformerBlock(embed_dim, num_heads, ff_dim, dropout)
             for _ in range(num_layers)
         ])
+
         self.norm = nn.LayerNorm(embed_dim)
 
-        # OC heads
-        # beta is a scalar indicating if a token is a condensation point
+        # Heads
         self.beta_head = nn.Linear(embed_dim, 1)
-        # embed is a vector such that tokens from the same instance should have similar embedding, and
-        # tokens from separate instances should have a dissimilar embedding
         self.embed_head = nn.Linear(embed_dim, embed_dim)
+
+        # -------------------------------
+        # Important stabilizing init
+        # Makes model start with low β everywhere instead of 0.5 confusion
+        # -------------------------------
+        nn.init.constant_(self.beta_head.bias, -5.0)
+        nn.init.constant_(self.beta_head.weight, 0.0)
         
 
     def forward(self, hits):
