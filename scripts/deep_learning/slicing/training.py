@@ -80,7 +80,7 @@ def train_one_epoch(
                 if noncp_mask.any():
                     writer.add_histogram("beta/noncp", beta_flat[noncp_mask], global_step)
 
-                pred_cp = (beta_flat > 0.8).sum().item()
+                pred_cp = (beta_flat > 0.5).sum().item()
                 true_cp = cp_mask.sum().item()
 
                 writer.add_scalar("cp/pred_count", pred_cp, global_step)

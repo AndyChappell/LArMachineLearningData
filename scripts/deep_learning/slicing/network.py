@@ -101,7 +101,7 @@ class ObjectCondensationNet(nn.Module):
         self.embed_head = nn.Linear(embed_dim, embed_dim)
 
         # Stabilising init for β
-        nn.init.constant_(self.beta_head.bias, -5.0)
+        nn.init.constant_(self.beta_head.bias, -2.5)  #-5.0
         nn.init.constant_(self.beta_head.weight, 0.0)
 
 

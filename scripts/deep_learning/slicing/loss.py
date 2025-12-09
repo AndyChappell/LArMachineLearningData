@@ -7,7 +7,7 @@ class ObjectCondensationLoss(nn.Module):
     def __init__(
         self,
         attraction_weight=1.0,
-        repulsion_weight=1.0,
+        repulsion_weight=1.5,#1.0,
         margin_weight=5.0,
         threshold=0.5,
         margin=0.2
