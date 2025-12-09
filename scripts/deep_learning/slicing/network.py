@@ -58,42 +58,183 @@ class FlashTransformerBlock(nn.Module):
         return x
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
 class ObjectCondensationNet(nn.Module):
-    def __init__(self, input_dim, embed_dim, num_heads, num_layers, ff_dim, dropout=0.1):
+    def __init__(
+        self,
+        input_dim,      # number of raw hit features, e.g. [x,z,view,...]
+        embed_dim,
+        num_heads,
+        num_layers,
+        ff_dim,
+        num_classes=None,   # kept for compatibility
+        dropout=0.1,
+        knn_k=16            # neighbors for local geometry
+    ):
         super().__init__()
 
-        self.input_proj = nn.Linear(input_dim, embed_dim)
+        self.knn_k = knn_k
+
+        # We now add ONLY 2 geometric features: mean_knn_dist, density
+        geom_dim = 2
+        total_in = input_dim + geom_dim
+
+        self.input_proj = nn.Linear(total_in, embed_dim)
 
         self.layers = nn.ModuleList([
             FlashTransformerBlock(embed_dim, num_heads, ff_dim, dropout)
             for _ in range(num_layers)
         ])
-
         self.norm = nn.LayerNorm(embed_dim)
 
-        # Heads
-        self.beta_head = nn.Linear(embed_dim, 1)
+        # OC heads
+        self.beta_head  = nn.Linear(embed_dim, 1)
         self.embed_head = nn.Linear(embed_dim, embed_dim)
 
-        # -------------------------------
-        # Important stabilizing init
-        # Makes model start with low β everywhere instead of 0.5 confusion
-        # -------------------------------
+        # Stabilising init for β
         nn.init.constant_(self.beta_head.bias, -5.0)
         nn.init.constant_(self.beta_head.weight, 0.0)
-        
 
+
+    def _local_geometry(self, hits, sample_size=4096):
+        """
+        Memory-safe approximate kNN geometry.
+    
+        hits: (B,N,F) with at least x,z as the first 2 features.
+        Returns:
+            mean_knn_dist: (B,N,1)
+            density:       (B,N,1)
+        """
+        B, N, F = hits.shape
+        device = hits.device
+        dtype  = hits.dtype
+    
+        if N < 2:
+            zero = torch.zeros(B, N, 1, device=device, dtype=dtype)
+            return zero, zero
+    
+        coords   = hits[..., :2]          # (B,N,2)
+        has_view = F >= 3
+        views    = hits[..., 2:3] if has_view else None
+    
+        # -----------------------------
+        # 1) Choose reference subset
+        # -----------------------------
+        if N > sample_size:
+            idx = torch.randperm(N, device=device)[:sample_size]
+            ref_coords = coords[:, idx, :]          # (B,S,2)
+            ref_views  = views[:, idx, :] if has_view else None
+        else:
+            ref_coords = coords                     # (B,N,2)
+            ref_views  = views
+    
+        # -----------------------------
+        # 2) Distances only to refs
+        # -----------------------------
+        dist = torch.cdist(coords, ref_coords)      # (B,N,S)
+    
+        # Limit insane distances to something reasonable
+        dist = torch.nan_to_num(dist, nan=0.0, posinf=1e4, neginf=0.0)
+        dist = dist.clamp(min=0.0, max=1e4)
+    
+        if has_view:
+            view_equal = (views == ref_views.transpose(-2, -1))  # (B,N,S)
+            # Very large penalty for cross-view, but finite
+            dist = dist + (~view_equal) * 1e4
+    
+        # -----------------------------
+        # 3) kNN distances
+        # -----------------------------
+        k = min(self.knn_k, dist.size(-1))
+        knn_dists = dist.topk(k, largest=False).values    # (B,N,k)
+    
+        mean_knn_dist = knn_dists.mean(dim=-1, keepdim=True)   # (B,N,1)
+        # Clamp to avoid division extremes
+        mean_knn_dist = mean_knn_dist.clamp(min=1e-3, max=1e3)
+    
+        density = 1.0 / mean_knn_dist
+        density = density.clamp(min=0.0, max=1e3)
+    
+        mean_knn_dist = torch.nan_to_num(mean_knn_dist, nan=0.0, posinf=1e3, neginf=0.0)
+        density       = torch.nan_to_num(density,       nan=0.0, posinf=1e3, neginf=0.0)
+    
+        return mean_knn_dist.to(dtype), density.to(dtype)
+
+
+    # -------------------------------
+    # Forward
+    # -------------------------------
     def forward(self, hits):
         """
-        hits: (B, N, F)
-        NOTE: mask is intentionally NOT passed through. Keep mask only for loss/metrics.
+        hits: (B, N, F_raw)
+          with at least x,z in the first 2 channels.
         """
-        x = self.input_proj(hits)
+        mean_knn_dist, density = self._local_geometry(hits)
+        geom_feats = torch.cat([mean_knn_dist, density], dim=-1)
+        hits_aug   = torch.cat([hits, geom_feats], dim=-1)
+
+        x = self.input_proj(hits_aug)
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x)
 
-        beta = self.beta_head(x)             # (B, N, 1)
-        embed = self.embed_head(x)           # (B, N, D)
+        beta  = self.beta_head(x)    # (B,N,1)
+        embed = self.embed_head(x)   # (B,N,D)
 
         return {"beta": beta, "embed": embed}
+
+
+
+
+def full_local_geometry(self, hits):
+    """
+    hits: (B, N, F) with at least x,z as first 2 features.
+          If view is present as 3rd feature, we ignore cross-view neighbours.
+
+    Returns:
+        mean_knn_dist: (B,N,1)
+        density:       (B,N,1)
+    """
+    B, N, F = hits.shape
+    device = hits.device
+    dtype  = hits.dtype
+
+    if N < 2:
+        zero = torch.zeros(B, N, 1, device=device, dtype=dtype)
+        return zero, zero
+
+    coords = hits[..., :2]     # (B,N,2)  -> [x,z]
+    has_view = F >= 3
+
+    if has_view:
+        views = hits[..., 2:3]           # (B,N,1)
+    else:
+        views = None
+
+    # pairwise distances (B,N,N)
+    dist = torch.cdist(coords, coords)
+
+    # optionally restrict neighbors to same view
+    if has_view:
+        view_equal = (views == views.transpose(-2, -1))  # (B,N,N)
+        # large penalty for cross-view so they never appear in top-k
+        dist = dist + (~view_equal) * 1e6
+
+    # choose k neighbours (may include self; that's fine)
+    k = min(self.knn_k, N)
+    knn = dist.topk(k, largest=False)
+    knn_dists = knn.values    # (B,N,k)
+
+    mean_knn_dist = knn_dists.mean(dim=-1, keepdim=True)   # (B,N,1)
+    density       = 1.0 / (mean_knn_dist + 1e-6)          # (B,N,1)
+
+    return mean_knn_dist.to(dtype), density.to(dtype)
