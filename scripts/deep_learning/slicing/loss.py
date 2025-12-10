@@ -7,7 +7,7 @@ class ObjectCondensationLoss(nn.Module):
     def __init__(
         self,
         attraction_weight=1.0,
-        repulsion_weight=1.5,#1.0,
+        repulsion_weight=1.5,   # you already bumped this
         margin_weight=5.0,
         threshold=0.5,
         margin=0.2
@@ -24,7 +24,7 @@ class ObjectCondensationLoss(nn.Module):
         embed = pred["embed"]             # (B,N,D)
         B, N, D = embed.shape
 
-        # Global finite check: if something is already broken, punt
+        # Global finite check
         if not torch.isfinite(beta).all() or not torch.isfinite(embed).all():
             beta  = torch.nan_to_num(beta,  0.0, 0.0, 0.0)
             embed = torch.nan_to_num(embed, 0.0, 0.0, 0.0)
@@ -34,14 +34,13 @@ class ObjectCondensationLoss(nn.Module):
         count = 0
 
         for b in range(B):
-            sid    = slice_id[b]             # (N,)
-            cp_mask    = (is_cp[b] == 1)
+            sid        = slice_id[b]          # (N,)
+            cp_mask    = (is_cp[b] == 1)      # (N,)
             noncp_mask = ~cp_mask
 
-            beta_b = beta[b]
-            emb_b  = embed[b]
+            beta_b = beta[b]                  # (N,)
+            emb_b  = embed[b]                 # (N,D)
 
-            # Per-event finite check
             if (not torch.isfinite(beta_b).all()) or (not torch.isfinite(emb_b).all()):
                 continue
 
@@ -50,21 +49,55 @@ class ObjectCondensationLoss(nn.Module):
             if pos_count < 1 or neg_count < 1:
                 continue
 
-            # --------------------------------
-            # 1) β loss: BCE + margin
-            # --------------------------------
-            labels = cp_mask.float()
+            unique_ids = sid.unique()
 
-            # clamp logits before BCE for stability
+            # --------------------------------
+            # 1) β loss: slice-softmax CP selection + margin
+            # --------------------------------
+            tau = 0.7     # temperature for sharpening competition
+            beta_slice_ce = 0.0
+            slice_count   = 0
+
+            # Slice-wise softmax over β, with one CP target per slice
+            for inst in unique_ids:
+                inst_mask = (sid == inst)          # hits in this slice
+                inst_cp   = inst_mask & cp_mask    # CP in this slice
+
+                # We expect exactly 1 CP per slice; if not, skip this slice
+                if inst_cp.sum() != 1:
+                    continue
+
+                # absolute indices of hits in this slice
+                idx     = torch.where(inst_mask)[0]        # (K,)
+                cp_idx  = torch.where(inst_cp)[0][0]       # scalar
+
+                # logits for this slice
+                logits = beta_b[idx]                       # (K,)
+                logits = logits.clamp(-20.0, 20.0)         # stability
+                norm_logits = logits / tau                 # temperature scaling
+
+                # softmax over hits in this slice
+                p = F.softmax(norm_logits, dim=0)          # (K,), sum=1
+
+                # CP should get probability 1, others 0
+                target = torch.zeros_like(p)
+                # find local index of CP within this slice
+                cp_local = (idx == cp_idx).nonzero(as_tuple=True)[0]
+                target[cp_local] = 1.0
+
+                # cross-entropy on probabilities
+                slice_loss = (-target * torch.log(p + 1e-9)).sum()
+                beta_slice_ce += slice_loss
+                slice_count   += 1
+
+            if slice_count == 0:
+                # no valid slices in this event
+                continue
+
+            beta_slice_ce = beta_slice_ce / slice_count
+
+            # Optional: retain your margin regulariser on absolute β
             beta_b_clamped = beta_b.clamp(min=-20.0, max=20.0)
-
-            pos_weight = (neg_count / (pos_count + 1e-6)).detach()
-            bce_loss = F.binary_cross_entropy_with_logits(
-                beta_b_clamped,
-                labels,
-                pos_weight=torch.tensor(pos_weight, device=beta_b.device)
-            )
-
             beta_prob = torch.sigmoid(beta_b_clamped)
 
             thr  = self.threshold
@@ -82,15 +115,14 @@ class ObjectCondensationLoss(nn.Module):
 
             margin_loss = pos_m + neg_m
 
-            beta_loss = bce_loss + self.margin_weight * margin_loss
+            # Final β loss for this event
+            beta_loss = beta_slice_ce + self.margin_weight * margin_loss
             beta_log += beta_loss.detach()
 
             # --------------------------------
-            # 2) Attraction loss
+            # 2) Attraction loss (unchanged)
             # --------------------------------
             attraction_loss = 0.0
-            unique_ids = sid.unique()
-
             for inst in unique_ids:
                 inst_mask = (sid == inst)
                 inst_hits = emb_b[inst_mask]
@@ -101,14 +133,14 @@ class ObjectCondensationLoss(nn.Module):
 
                 inst_cp = inst_cp[0]
                 d2 = (inst_hits - inst_cp).pow(2).sum(dim=1)  # (K,)
-                d2 = d2.clamp(max=50.0)                       # clamp distances
+                d2 = d2.clamp(max=50.0)
                 attraction_loss += d2.mean()
 
             attraction_loss *= self.attraction_weight
             attr_log += attraction_loss.detach()
 
             # --------------------------------
-            # 3) Repulsion loss
+            # 3) Repulsion loss (unchanged)
             # --------------------------------
             repulsion_loss = 0.0
             cp_idx = torch.where(cp_mask)[0]
