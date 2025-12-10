@@ -7,10 +7,12 @@ class ObjectCondensationLoss(nn.Module):
     def __init__(
         self,
         attraction_weight=1.0,
-        repulsion_weight=1.5,   # you already bumped this
+        repulsion_weight=1.5,
         margin_weight=5.0,
         threshold=0.5,
-        margin=0.2
+        margin=0.2,
+        noncp_supp_weight=0.5,
+        repulsion_across_slices_only=True
     ):
         super().__init__()
         self.attraction_weight = attraction_weight
@@ -18,152 +20,106 @@ class ObjectCondensationLoss(nn.Module):
         self.margin_weight     = margin_weight
         self.threshold         = threshold
         self.margin            = margin
+        self.noncp_supp_weight = noncp_supp_weight
+        self.repulsion_across_slices_only = repulsion_across_slices_only
 
     def forward(self, pred, slice_id, is_cp):
-        beta  = pred["beta"].squeeze(-1)  # (B,N)
-        embed = pred["embed"]             # (B,N,D)
-        B, N, D = embed.shape
+        beta  = pred["beta"].squeeze(-1)   # (B,N)
+        embed = pred["embed"]              # (B,N,D)
+        B,N,D = embed.shape
 
-        # Global finite check
-        if not torch.isfinite(beta).all() or not torch.isfinite(embed).all():
-            beta  = torch.nan_to_num(beta,  0.0, 0.0, 0.0)
-            embed = torch.nan_to_num(embed, 0.0, 0.0, 0.0)
+        # Sanitise NaNs — prevents cusolver explosions
+        beta  = torch.nan_to_num(beta)
+        embed = torch.nan_to_num(embed)
 
-        total_loss = 0.0
-        beta_log = attr_log = repl_log = 0.0
-        count = 0
+        total_loss = 0; beta_acc=0; attr_acc=0; rep_acc=0; valid_batches=0
 
         for b in range(B):
-            sid        = slice_id[b]          # (N,)
-            cp_mask    = (is_cp[b] == 1)      # (N,)
-            noncp_mask = ~cp_mask
+            sid   = slice_id[b]       # (N)
+            cp    = (is_cp[b]==1)     # condensation points
+            noncp = ~cp               # everything else is non-CP
+            beta_b = beta[b]
+            emb_b  = embed[b]
 
-            beta_b = beta[b]                  # (N,)
-            emb_b  = embed[b]                 # (N,D)
+            if cp.sum()==0: continue
 
-            if (not torch.isfinite(beta_b).all()) or (not torch.isfinite(emb_b).all()):
-                continue
+            #================#
+            #   BETA LOSS    #
+            #================#
+            labels = cp.float()
+            pos_wt = (noncp.sum() / (cp.sum()+1e-6)).detach()
+            beta_logits = beta_b.clamp(-20,20)
 
-            pos_count = cp_mask.sum()
-            neg_count = noncp_mask.sum()
-            if pos_count < 1 or neg_count < 1:
-                continue
+            bce = F.binary_cross_entropy_with_logits(
+                beta_logits, labels, pos_weight=torch.tensor(pos_wt,device=beta_b.device)
+            )
+            prob = torch.sigmoid(beta_logits)
 
-            unique_ids = sid.unique()
+            # margin terms
+            pos_margin = F.relu((self.threshold+self.margin)-prob[cp]).mean()
+            neg_margin = F.relu(prob[noncp]-(self.threshold-self.margin)).mean()
 
-            # --------------------------------
-            # 1) β loss: slice-softmax CP selection + margin
-            # --------------------------------
-            tau = 0.7     # temperature for sharpening competition
-            beta_slice_ce = 0.0
-            slice_count   = 0
+            # non-CP suppression
+            ncp_supp = (prob[noncp]**2).mean()
 
-            # Slice-wise softmax over β, with one CP target per slice
-            for inst in unique_ids:
-                inst_mask = (sid == inst)          # hits in this slice
-                inst_cp   = inst_mask & cp_mask    # CP in this slice
+            beta_loss = bce + self.margin_weight*(pos_margin+neg_margin) + self.noncp_supp_weight*ncp_supp
+            beta_acc += beta_loss.detach()
 
-                # We expect exactly 1 CP per slice; if not, skip this slice
-                if inst_cp.sum() != 1:
-                    continue
+            #================#
+            # ATTRACTION     #
+            #================#
+            # Compute cp_embeddings per instance (vectorized)
+            inst_ids = sid.unique()
+            cp_emb = []
+            att_sum = 0; att_count = 0
 
-                # absolute indices of hits in this slice
-                idx     = torch.where(inst_mask)[0]        # (K,)
-                cp_idx  = torch.where(inst_cp)[0][0]       # scalar
+            for inst in inst_ids:
+                inst_mask = sid==inst
+                if (cp & inst_mask).sum()==0: continue
+                cp_vec = emb_b[cp & inst_mask][0]            # single CP vector
+                d2 = (emb_b[inst_mask]-cp_vec).pow(2).sum(-1)
+                att_sum += d2.clamp(max=50).mean()
+                att_count+=1
 
-                # logits for this slice
-                logits = beta_b[idx]                       # (K,)
-                logits = logits.clamp(-20.0, 20.0)         # stability
-                norm_logits = logits / tau                 # temperature scaling
-
-                # softmax over hits in this slice
-                p = F.softmax(norm_logits, dim=0)          # (K,), sum=1
-
-                # CP should get probability 1, others 0
-                target = torch.zeros_like(p)
-                # find local index of CP within this slice
-                cp_local = (idx == cp_idx).nonzero(as_tuple=True)[0]
-                target[cp_local] = 1.0
-
-                # cross-entropy on probabilities
-                slice_loss = (-target * torch.log(p + 1e-9)).sum()
-                beta_slice_ce += slice_loss
-                slice_count   += 1
-
-            if slice_count == 0:
-                # no valid slices in this event
-                continue
-
-            beta_slice_ce = beta_slice_ce / slice_count
-
-            # Optional: retain your margin regulariser on absolute β
-            beta_b_clamped = beta_b.clamp(min=-20.0, max=20.0)
-            beta_prob = torch.sigmoid(beta_b_clamped)
-
-            thr  = self.threshold
-            marg = self.margin
-
-            if cp_mask.any():
-                pos_m = F.relu((thr + marg) - beta_prob[cp_mask]).mean()
+            if att_count>0:
+                attraction = self.attraction_weight*(att_sum/att_count)
             else:
-                pos_m = torch.tensor(0.0, device=beta_b.device)
+                attraction = torch.tensor(0.,device=beta.device)
 
-            if noncp_mask.any():
-                neg_m = F.relu(beta_prob[noncp_mask] - (thr - marg)).mean()
-            else:
-                neg_m = torch.tensor(0.0, device=beta_b.device)
+            attr_acc+= attraction.detach()
 
-            margin_loss = pos_m + neg_m
+            #================#
+            # REPULSION      #
+            #================#
+            repulsion=0
+            cp_idx = torch.where(cp)[0]
 
-            # Final β loss for this event
-            beta_loss = beta_slice_ce + self.margin_weight * margin_loss
-            beta_log += beta_loss.detach()
+            if len(cp_idx)>1:
+                cp_embs = emb_b[cp_idx]         # (M,D)
+                sid_cp  = sid[cp_idx]           # (M)
 
-            # --------------------------------
-            # 2) Attraction loss (unchanged)
-            # --------------------------------
-            attraction_loss = 0.0
-            for inst in unique_ids:
-                inst_mask = (sid == inst)
-                inst_hits = emb_b[inst_mask]
-                inst_cp   = emb_b[inst_mask & cp_mask]
+                diff = (cp_embs.unsqueeze(1)-cp_embs.unsqueeze(0)).pow(2).sum(-1)  # (M,M)
 
-                if inst_cp.numel() == 0:
-                    continue
+                if self.repulsion_across_slices_only:
+                    mask = (sid_cp.unsqueeze(1)!=sid_cp.unsqueeze(0))
+                    if mask.any():
+                        repulsion = torch.exp(-diff[mask].clamp(max=50)).mean()*self.repulsion_weight
+                else:
+                    repulsion = torch.exp(-diff.clamp(max=50)).mean()*self.repulsion_weight
 
-                inst_cp = inst_cp[0]
-                d2 = (inst_hits - inst_cp).pow(2).sum(dim=1)  # (K,)
-                d2 = d2.clamp(max=50.0)
-                attraction_loss += d2.mean()
+            rep_acc+=repulsion.detach()
 
-            attraction_loss *= self.attraction_weight
-            attr_log += attraction_loss.detach()
+            total_loss += (beta_loss+attraction+repulsion)
+            valid_batches+=1
 
-            # --------------------------------
-            # 3) Repulsion loss (unchanged)
-            # --------------------------------
-            repulsion_loss = 0.0
-            cp_idx = torch.where(cp_mask)[0]
-            if len(cp_idx) > 1:
-                cp_emb = emb_b[cp_idx]
-                diff   = cp_emb.unsqueeze(1) - cp_emb.unsqueeze(0)
-                d2     = (diff ** 2).sum(dim=2)
-                d2     = d2.clamp(max=50.0)
-                repulsion_loss = torch.exp(-d2).mean() * self.repulsion_weight
+        if valid_batches==0:
+            zero=torch.tensor(0.,device=beta.device)
+            return zero, {"beta_loss":zero,"attr_loss":zero,"repl_loss":zero}
 
-            repl_log += repulsion_loss.detach()
-
-            total_loss += (beta_loss + attraction_loss + repulsion_loss)
-            count += 1
-
-        if count == 0:
-            zero = torch.tensor(0.0, device=beta.device)
-            return zero, {"beta_loss": zero, "attr_loss": zero, "repl_loss": zero}
-
-        final_loss = total_loss / count
-        extras = {
-            "beta_loss": beta_log / count,
-            "attr_loss": attr_log / count,
-            "repl_loss": repl_log / count,
+        final = total_loss/valid_batches
+        extras={
+            "beta_loss":beta_acc/valid_batches,
+            "attr_loss":attr_acc/valid_batches,
+            "repl_loss":rep_acc/valid_batches
         }
-        return final_loss, extras
+        return final, extras
