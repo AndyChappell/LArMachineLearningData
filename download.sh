@@ -51,7 +51,7 @@ fi
 
 if [[ "$1" == "dunend" ]]
 then
-  download "Ar7fS1gRdZ1j4Wx" "PandoraBdt_PfoCharacterisation_DUNEND_LAR_v04_18_00.xml"
+  download "OYWBymsfABcobi7" "PandoraBdt_PfoCharacterisation_DUNEND_LAR_v04_19_03.xml"
 fi
 
 ### PandoraMVAs
