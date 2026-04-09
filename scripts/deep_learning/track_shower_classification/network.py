@@ -12,7 +12,11 @@ class PowerMHA(nn.Module):
 
     where φ(x) = relu(x)^p
 
-    Complexity: O(N) in sequence length
+    Complexity: O(N) in sequence length.
+
+    Based on the linear attention mechanism of:
+    Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention (Katharopoulos et al., 2020)
+     	arXiv:2006.16236
     """
     def __init__(self, embed_dim, num_heads, dropout=0.0, power=2.0, eps=1e-6):
         """
