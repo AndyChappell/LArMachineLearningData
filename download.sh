@@ -79,6 +79,13 @@ then
     return 1
   fi
 
+  download "lfnGRndqKcpYo3Z" "PandoraNet_ShowerGrowing_DUNEFD_HD_Attn_v05_00_00.pt"
+  download "fXVLcSoh5s6RdDW" "PandoraNet_ShowerGrowing_DUNEFD_HD_Encoder_v05_00_00.pt"
+  download "Wz6D2ccdilPqGym" "PandoraNet_ShowerGrowing_DUNEFD_HD_Sim_v05_00_00.pt"
+  download "I69c6Pc78Rg7noj" "PandoraNet_ShowerGrowing_DUNEFD_VD_Attn_v05_00_00.pt"
+  download "mcPqbgBwBjsl2qo" "PandoraNet_ShowerGrowing_DUNEFD_VD_Encoder_v05_00_00.pt"
+  download "5KkZhMjnwm49tvO" "PandoraNet_ShowerGrowing_DUNEFD_VD_Sim_v05_00_00.pt"
+
   if [[ "$2" == "lbl" ]]
   then
     download "F3ctEucYgFXhVZF" "PandoraNet_Vertex_DUNEFD_HD_Accel_1_U_v04_06_00.pt"
