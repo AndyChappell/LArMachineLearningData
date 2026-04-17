@@ -25,7 +25,7 @@ def root_to_hdf5(in_filename, treename, out_filename):
     Convert ROOT LArTPC hit data to an efficient HDF5 format.
 
     Input branches expected:
-        - 'xx', 'zz'              : Cartesian hit coordinates (relative to vertex)
+        - 'x', 'z'                : Cartesian hit coordinates (relative to vertex)
         - 'r', 'cosTheta', 'sinTheta' : Polar coordinates
         - 'width'                 : hit width (drift direction)
         - 'adc'                   : (already log-scaled)
@@ -52,9 +52,9 @@ def root_to_hdf5(in_filename, treename, out_filename):
         return out_filename, num_events
 
     branches = [
-        'xx', 'zz',
-        'r', 'cosTheta', 'sinTheta',
-        'width', 'adc',
+        'x_rel', 'z_rel', 'x_abs', 'z_abs', 'width', 'adc',
+        'r', 'cos_theta', 'sin_theta',
+        'wire_pitch', 'wire_angle',
         'semantic_label'
     ]
 
@@ -80,13 +80,17 @@ def root_to_hdf5(in_filename, treename, out_filename):
 
         # Build feature tensor per hit
         hits_ak = ak.concatenate([
-            arrays['xx'][..., None],
-            arrays['zz'][..., None],
-            arrays['r'][..., None],
-            arrays['cosTheta'][..., None],
-            arrays['sinTheta'][..., None],
+            arrays['x_rel'][..., None],
+            arrays['z_rel'][..., None],
+            arrays['x_abs'][..., None],
+            arrays['z_abs'][..., None],
             arrays['width'][..., None],
-            arrays['adc'][..., None]
+            arrays['adc'][..., None],
+            arrays['r'][..., None],
+            arrays['cos_theta'][..., None],
+            arrays['sin_theta'][..., None],
+            arrays['wire_pitch'][..., None],
+            arrays['wire_angle'][..., None]
         ], axis=-1)
 
         labels_ak = arrays['semantic_label']

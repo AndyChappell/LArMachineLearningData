@@ -43,11 +43,12 @@ class PowerMHA(nn.Module):
         """
         return torch.relu(x) ** self.power
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         """
         Run inference
 
         x: (B, N, C)
+        mask: (B, N) boolean (True = valid)
         """
         B, N, C = x.shape
 
@@ -62,6 +63,17 @@ class PowerMHA(nn.Module):
         q = self.feature_map(q)  # (B, H, N, D)
         k = self.feature_map(k)  # (B, H, N, D)
 
+        if mask is not None:
+            mask_ = mask.unsqueeze(1).unsqueeze(-1).to(q.dtype)  # (B, 1, N, 1) (also ensure float)
+    
+            q = q * mask_
+            k = k * mask_
+            v = v * mask_
+
+        # ---- Dropout ----
+        if self.training and self.dropout > 0:
+            v = F.dropout(v, p=self.dropout)
+        
         # ---- Linear attention computation ----
 
         # Step 1: Aggregate K^T V
@@ -74,7 +86,7 @@ class PowerMHA(nn.Module):
 
         # (B, H, N)
         denom = torch.einsum("bhnd,bhd->bhn", q, k_sum)
-        denom = denom + self.eps  # numerical stability
+        denom = denom.clamp(min=self.eps)  # numerical stability
 
         # Step 3: Compute output
         # (B, H, N, D)
@@ -83,9 +95,9 @@ class PowerMHA(nn.Module):
         # Normalize
         out = out / denom.unsqueeze(-1)
 
-        # ---- Dropout on output ----
-        if self.training and self.dropout > 0:
-            out = F.dropout(out, p=self.dropout)
+        # Zero out padded outputs explicitly (clean)
+        if mask is not None:
+            out = out * mask_
 
         # ---- Merge heads ----
         out = (
