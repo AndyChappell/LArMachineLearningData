@@ -59,6 +59,11 @@ class PowerMHA(nn.Module):
 
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, N, D)
 
+        # ---- Scale QK^T / sqrt(d) ----
+        scale = self.head_dim ** -0.5
+        q = q * scale
+        k = k * scale
+        
         # ---- Apply feature map ----
         q = self.feature_map(q)  # (B, H, N, D)
         k = self.feature_map(k)  # (B, H, N, D)
@@ -66,14 +71,9 @@ class PowerMHA(nn.Module):
         if mask is not None:
             mask_ = mask.unsqueeze(1).unsqueeze(-1).to(q.dtype)  # (B, 1, N, 1) (also ensure float)
     
-            q = q * mask_
             k = k * mask_
             v = v * mask_
 
-        # ---- Dropout ----
-        if self.training and self.dropout > 0:
-            v = F.dropout(v, p=self.dropout)
-        
         # ---- Linear attention computation ----
 
         # Step 1: Aggregate K^T V
@@ -86,7 +86,7 @@ class PowerMHA(nn.Module):
 
         # (B, H, N)
         denom = torch.einsum("bhnd,bhd->bhn", q, k_sum)
-        denom = denom.clamp(min=self.eps)  # numerical stability
+        denom = denom + self.eps # numerical stability
 
         # Step 3: Compute output
         # (B, H, N, D)
@@ -94,6 +94,9 @@ class PowerMHA(nn.Module):
 
         # Normalize
         out = out / denom.unsqueeze(-1)
+
+        # ---- Dropout ----
+        out = F.dropout(out, p=self.dropout, training=self.training)
 
         # Zero out padded outputs explicitly (clean)
         if mask is not None:
@@ -128,11 +131,69 @@ class TransformerBlock(nn.Module):
             nn.Linear(ff_dim, embed_dim),
         )
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         """
         Run inference
         """
-        # No key_padding_mask forwarded here — attention runs on full sequence (including pads)
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ffn(self.norm2(x))
+        if mask is not None:
+            # zero padded tokens before norm
+            mask_ = mask.unsqueeze(-1)
+    
+            x = x * mask_
+            x = x + self.attn(self.norm1(x), mask=mask)
+            x = x * mask_ # ensure padded tokens are zero post network operations
+    
+            x = x + self.ffn(self.norm2(x))
+            x = x * mask_
+    
+        else:
+            x = x + self.attn(self.norm1(x))
+            x = x + self.ffn(self.norm2(x))
+    
         return x
+
+
+class LArTPCTransformer(nn.Module):
+    def __init__(self, input_dim, embed_dim, num_heads, ff_dim, num_layers, num_classes, dropout=0.1):
+        """
+        Constructor
+        """
+        super().__init__()
+
+        # ---- Input embedding ----
+        self.input_proj = nn.Linear(input_dim, embed_dim)
+
+        # ---- Transformer stack ----
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+        # ---- Output head ----
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x, mask=None):
+        """
+        Run inference
+        """
+
+        # ---- Input projection ----
+        x = self.input_proj(x)
+
+        # ---- Transformer ----
+        for layer in self.layers:
+            x = layer(x, mask=mask)
+
+        x = self.norm(x)
+
+        # ---- Classification ----
+        logits = self.classifier(x)  # (B, N, num_classes)
+
+        return logits
