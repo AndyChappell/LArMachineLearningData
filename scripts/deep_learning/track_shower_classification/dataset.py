@@ -22,40 +22,35 @@ class LArTPCSequenceDataset(Dataset):
             "labels": (N_hits,)
         }
     """
-
     def __init__(self, h5_path):
         super().__init__()
         self.h5_path = h5_path
-        self.file = None
 
-        # Read metadata only
+        # Read metadata only — no file handle stored on self,
+        # so DataLoader worker forking is safe.
         with h5py.File(self.h5_path, "r") as hf:
+            if not all(k in hf for k in ("hits", "labels", "event_ptr")):
+                raise ValueError(f"{h5_path} is missing required datasets (hits, labels, event_ptr)")
             self.num_events = hf["event_ptr"].shape[0] - 1
 
     def __len__(self):
         return self.num_events
 
-    def _ensure_open(self):
-        if self.file is None:
-            self.file = h5py.File(self.h5_path, "r")
-            self.hits = self.file["hits"]
-            self.labels = self.file["labels"]
-            self.event_ptr = self.file["event_ptr"]
-
     def __getitem__(self, idx):
-        self._ensure_open()
-
         if idx >= self.num_events:
             raise IndexError("Index out of range")
 
-        start = self.event_ptr[idx]
-        end = self.event_ptr[idx + 1]
-
-        hits = torch.from_numpy(self.hits[start:end]).float()
-        labels = torch.from_numpy(self.labels[start:end]).long()
+        # Open and close per call — required for DataLoader multiprocessing safety.
+        # HDF5 open overhead is negligible relative to the read itself.
+        with h5py.File(self.h5_path, "r") as hf:
+            ptr = hf["event_ptr"]
+            start = ptr[idx]
+            end   = ptr[idx + 1]
+            hits   = torch.from_numpy(hf["hits"][start:end]).float()
+            labels = torch.from_numpy(hf["labels"][start:end]).long()
 
         return {
-            "hits": hits,
+            "hits":   hits,
             "labels": labels,
         }
 

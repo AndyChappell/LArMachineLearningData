@@ -1,6 +1,6 @@
 import torch
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, writer=None, global_step=0):
+def train_one_epoch(model, dataloader, optimizer, criterion, device, writer=None, epoch=0):
     model = model.to(device)
     model.train()
 
@@ -8,7 +8,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, writer=None
     total_tokens = 0
     total_correct = 0
 
-    for batch in dataloader:
+    for batch_idx, batch in enumerate(dataloader):
         hits = batch["hits"].to(device)         # (B, N, F)
         labels = batch["labels"].to(device)     # (B, N)
         mask = batch["mask"].to(device)         # (B, N)
@@ -30,6 +30,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, writer=None
         loss = criterion(outputs, labels)
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         preds = outputs.argmax(dim=-1)
@@ -41,15 +42,14 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, writer=None
         total_correct += correct
 
         if writer is not None:
-            writer.add_scalar("Loss/Train_batch", loss.item(), global_step)
-            writer.add_scalar("LR", optimizer.param_groups[0]["lr"], global_step)
-
-        global_step += 1
+            step = epoch * len(dataloader) + batch_idx
+            writer.add_scalar("Loss/Train_batch", loss.item(), step)
+            writer.add_scalar("LR", optimizer.param_groups[0]["lr"], step)
 
     avg_loss = total_loss / total_tokens
     accuracy = total_correct / total_tokens
 
-    return avg_loss, accuracy, global_step
+    return avg_loss, accuracy
 
 
 @torch.no_grad()

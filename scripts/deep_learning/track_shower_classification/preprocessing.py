@@ -58,66 +58,82 @@ def root_to_hdf5(in_filename, treename, out_filename):
         'semantic_label'
     ]
 
-    hits_list = []
-    labels_list = []
     event_ptr = [0]
+    num_features = 11
 
     # Get number of entries for progress tracking
     with uproot.open(f"{in_filename}:{treename}") as tree:
         num_entries = tree.num_entries
         step_size = max(1, num_entries // 10)
 
-    for arrays in tqdm(
-        uproot.iterate(
-            f"{in_filename}:{treename}",
-            branches,
-            step_size=step_size,
-            library='ak'
-        ),
-        total=int(math.ceil(num_entries / step_size)),
-        desc="Processing ROOT → HDF5"
-    ):
+    # Write incrementally — avoids holding entire dataset in memory at once.
+    with h5py.File(out_filename, 'w') as hf:
+        ds_hits = hf.create_dataset(
+            "hits", shape=(0, num_features), maxshape=(None, num_features),
+            dtype=np.float32, compression="lzf", chunks=(4096, num_features)
+        )
+        ds_labels = hf.create_dataset(
+            "labels", shape=(0,), maxshape=(None,),
+            dtype=np.int64, compression="lzf", chunks=(4096,)
+        )
 
-        # Build feature tensor per hit
-        hits_ak = ak.concatenate([
-            arrays['x_rel'][..., None],
-            arrays['z_rel'][..., None],
-            arrays['x_abs'][..., None],
-            arrays['z_abs'][..., None],
-            arrays['width'][..., None],
-            arrays['adc'][..., None],
-            arrays['r'][..., None],
-            arrays['cos_theta'][..., None],
-            arrays['sin_theta'][..., None],
-            arrays['wire_pitch'][..., None],
-            arrays['wire_angle'][..., None]
-        ], axis=-1)
+        for arrays in tqdm(
+            uproot.iterate(
+                f"{in_filename}:{treename}",
+                branches,
+                step_size=step_size,
+                library='ak'
+            ),
+            total=int(math.ceil(num_entries / step_size)),
+            desc="Processing ROOT → HDF5"
+        ):
+            # Build feature array for entire chunk at once
+            hits_ak = ak.concatenate([
+                arrays['x_rel'][..., None],
+                arrays['z_rel'][..., None],
+                arrays['x_abs'][..., None],
+                arrays['z_abs'][..., None],
+                arrays['width'][..., None],
+                arrays['adc'][..., None],
+                arrays['r'][..., None],
+                arrays['cos_theta'][..., None],
+                arrays['sin_theta'][..., None],
+                arrays['wire_pitch'][..., None],
+                arrays['wire_angle'][..., None]
+            ], axis=-1)
 
-        labels_ak = arrays['semantic_label']
+            labels_ak = arrays['semantic_label']
 
-        # Loop over events (variable-length)
-        for i in range(len(hits_ak)):
-            event_hits = ak.to_numpy(hits_ak[i])
-            if event_hits.shape[0] == 0:
+            # Per-event lengths for event_ptr — cheap, no full flatten needed
+            lengths = np.asarray(ak.num(labels_ak, axis=1))
+            nonempty = lengths > 0
+
+            if not np.any(nonempty):
                 continue
 
-            event_labels = ak.to_numpy(labels_ak[i] - 1)  # adjust if needed
+            # Flatten chunk to numpy in one call
+            hits_np   = ak.to_numpy(ak.flatten(hits_ak[nonempty],   axis=1)).astype(np.float32)
+            raw_labels = ak.to_numpy(ak.flatten(labels_ak[nonempty], axis=1))
 
-            hits_list.append(event_hits)
-            labels_list.append(event_labels)
+            assert raw_labels.min() >= 1, (
+                f"Expected 1-indexed labels but got min={raw_labels.min()}."
+            )
+            labels_np = (raw_labels - 1).astype(np.int64)
 
-            event_ptr.append(event_ptr[-1] + event_hits.shape[0])
+            # Append to resizable datasets
+            n_existing = ds_hits.shape[0]
+            n_new      = hits_np.shape[0]
+            ds_hits.resize(n_existing + n_new, axis=0)
+            ds_labels.resize(n_existing + n_new, axis=0)
+            ds_hits[n_existing:]   = hits_np
+            ds_labels[n_existing:] = labels_np
 
-    # Concatenate all events
-    hits_all = np.concatenate(hits_list, axis=0)
-    labels_all = np.concatenate(labels_list, axis=0)
-    event_ptr = np.array(event_ptr, dtype=np.int64)
+            # Build event_ptr increments from non-empty event lengths only
+            for length in lengths[nonempty]:
+                event_ptr.append(event_ptr[-1] + int(length))
 
-    # Write to HDF5
-    with h5py.File(out_filename, 'w') as hf:
-        hf.create_dataset("hits", data=hits_all, compression="lzf")
-        hf.create_dataset("labels", data=labels_all, compression="lzf")
-        hf.create_dataset("event_ptr", data=event_ptr)
+        event_ptr_np = np.array(event_ptr, dtype=np.int64)
+        hf.create_dataset("event_ptr", data=event_ptr_np)
 
     print(f"Saved {len(event_ptr) - 1} events to {out_filename}")
     return out_filename, len(event_ptr) - 1

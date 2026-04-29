@@ -59,14 +59,14 @@ class PowerMHA(nn.Module):
 
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, N, D)
 
+        # ---- Apply feature map ----
+        q = self.feature_map(q)  # (B, H, N, D)
+        k = self.feature_map(k)  # (B, H, N, D)
+        
         # ---- Scale QK^T / sqrt(d) ----
         scale = self.head_dim ** -0.5
         q = q * scale
         k = k * scale
-        
-        # ---- Apply feature map ----
-        q = self.feature_map(q)  # (B, H, N, D)
-        k = self.feature_map(k)  # (B, H, N, D)
 
         if mask is not None:
             mask_ = mask.unsqueeze(1).unsqueeze(-1).to(q.dtype)  # (B, 1, N, 1) (also ensure float)
@@ -86,7 +86,7 @@ class PowerMHA(nn.Module):
 
         # (B, H, N)
         denom = torch.einsum("bhnd,bhd->bhn", q, k_sum)
-        denom = denom + self.eps # numerical stability
+        denom = denom.clamp(min=self.eps) # numerical stability
 
         # Step 3: Compute output
         # (B, H, N, D)
@@ -136,20 +136,23 @@ class TransformerBlock(nn.Module):
         Run inference
         """
         if mask is not None:
-            # zero padded tokens before norm
-            mask_ = mask.unsqueeze(-1)
-    
+            mask_ = mask.unsqueeze(-1).to(x.dtype)
+
+            # Attention sub-layer
             x = x * mask_
             x = x + self.attn(self.norm1(x), mask=mask)
-            x = x * mask_ # ensure padded tokens are zero post network operations
-    
-            x = x + self.ffn(self.norm2(x))
             x = x * mask_
-    
+
+            # FFN sub-layer — zero padded tokens before norm2 so LayerNorm
+            # does not see zero vectors and produce spurious non-zero outputs.
+            normed = self.norm2(x) * mask_
+            x = x + self.ffn(normed)
+            x = x * mask_
+
         else:
             x = x + self.attn(self.norm1(x))
             x = x + self.ffn(self.norm2(x))
-    
+
         return x
 
 
