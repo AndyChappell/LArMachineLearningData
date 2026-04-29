@@ -1,11 +1,12 @@
 import torch
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device):
+def train_one_epoch(model, dataloader, optimizer, criterion, device, writer=None, global_step=0):
     model = model.to(device)
     model.train()
 
     total_loss = 0.0
     total_tokens = 0
+    total_correct = 0
 
     for batch in dataloader:
         hits = batch["hits"].to(device)         # (B, N, F)
@@ -31,12 +32,24 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
         loss.backward()
         optimizer.step()
 
+        preds = outputs.argmax(dim=-1)
+        correct = (preds == labels).sum().item()
+
         num_tokens = mask.sum().item()
         total_loss += loss.item() * num_tokens
         total_tokens += num_tokens
+        total_correct += correct
+
+        if writer is not None:
+            writer.add_scalar("Loss/Train_batch", loss.item(), global_step)
+            writer.add_scalar("LR", optimizer.param_groups[0]["lr"], global_step)
+
+        global_step += 1
 
     avg_loss = total_loss / total_tokens
-    return avg_loss
+    accuracy = total_correct / total_tokens
+
+    return avg_loss, accuracy, global_step
 
 
 @torch.no_grad()

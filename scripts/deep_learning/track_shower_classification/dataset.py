@@ -97,3 +97,33 @@ def collate_fn_pad(batch):
         "labels": padded_labels,
         "mask": mask,
     }
+
+
+def compute_class_weights(dataloader, num_classes, device="cpu"):
+    class_counts = torch.zeros(num_classes, dtype=torch.long)
+
+    for batch in dataloader:
+        labels = batch["labels"]
+
+        # --- Handle list vs tensor ---
+        if isinstance(labels, list):
+            labels = torch.cat(labels, dim=0)
+
+        # --- Ensure 1D ---
+        labels = labels.reshape(-1)
+
+        labels = labels.to(torch.long)
+        # Ignore padding
+        valid = (labels >= 0)
+        labels = labels[valid]
+
+        if labels.numel() == 0:
+            continue
+
+        counts = torch.bincount(labels, minlength=num_classes)
+        class_counts += counts
+
+    class_counts = class_counts.float().clamp(min=1)
+    weights = class_counts.sum() / (num_classes * class_counts)
+
+    return weights.to(device)
