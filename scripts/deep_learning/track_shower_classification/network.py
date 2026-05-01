@@ -62,7 +62,7 @@ class PowerMHA(nn.Module):
         # ---- Apply feature map ----
         q = self.feature_map(q)  # (B, H, N, D)
         k = self.feature_map(k)  # (B, H, N, D)
-        
+
         # ---- Scale QK^T / sqrt(d) ----
         scale = self.head_dim ** -0.5
         q = q * scale

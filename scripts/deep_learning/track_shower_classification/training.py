@@ -1,12 +1,14 @@
 import torch
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, writer=None, epoch=0):
+def train_one_epoch(model, dataloader, optimizer, criterion, device, scheduler=None, writer=None, epoch=0):
     model = model.to(device)
     model.train()
 
     total_loss = 0.0
     total_tokens = 0
     total_correct = 0
+    all_preds = []
+    all_labels = []
 
     for batch_idx, batch in enumerate(dataloader):
         hits = batch["hits"].to(device)         # (B, N, F)
@@ -32,9 +34,13 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, writer=None
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         preds = outputs.argmax(dim=-1)
         correct = (preds == labels).sum().item()
+        all_preds.append(preds.cpu())
+        all_labels.append(labels.cpu())
 
         num_tokens = mask.sum().item()
         total_loss += loss.item() * num_tokens
@@ -49,7 +55,9 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, writer=None
     avg_loss = total_loss / total_tokens
     accuracy = total_correct / total_tokens
 
-    return avg_loss, accuracy
+    all_preds  = torch.cat(all_preds).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+    return avg_loss, accuracy, all_preds, all_labels
 
 
 @torch.no_grad()
@@ -60,6 +68,8 @@ def validate_one_epoch(model, dataloader, criterion, device):
     total_loss = 0.0
     total_tokens = 0
     total_correct = 0
+    all_preds = []
+    all_labels = []
 
     for batch in dataloader:
         hits = batch["hits"].to(device)
@@ -81,6 +91,8 @@ def validate_one_epoch(model, dataloader, criterion, device):
         # Accuracy
         preds = outputs_valid.argmax(dim=-1)
         correct = (preds == labels_valid).sum().item()
+        all_preds.append(preds.cpu())
+        all_labels.append(labels_valid.cpu())
 
         num_tokens = mask_flat.sum().item()
 
@@ -91,4 +103,6 @@ def validate_one_epoch(model, dataloader, criterion, device):
     avg_loss = total_loss / total_tokens
     accuracy = total_correct / total_tokens
 
-    return avg_loss, accuracy
+    all_preds  = torch.cat(all_preds).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+    return avg_loss, accuracy, all_preds, all_labels
