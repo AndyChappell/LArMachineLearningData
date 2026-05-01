@@ -1,6 +1,6 @@
 import torch
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, scheduler=None, writer=None, epoch=0):
+def train_one_epoch(model, dataloader, optimizer, criterion, device, writer=None, epoch=0):
     model = model.to(device)
     model.train()
 
@@ -34,8 +34,6 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, scheduler=N
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
 
         preds = outputs.argmax(dim=-1)
         correct = (preds == labels).sum().item()

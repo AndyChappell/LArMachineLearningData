@@ -1,0 +1,144 @@
+try:
+    from IPython import get_ipython
+    if 'IPKernelApp' in get_ipython().config:
+        from tqdm.notebook import tqdm
+    else:
+        from tqdm import tqdm
+        import matplotlib
+        matplotlib.use('Agg')
+        
+except Exception:
+    from tqdm import tqdm
+    import matplotlib
+    matplotlib.use('Agg')
+
+from torch.utils.data import DataLoader, random_split, Subset
+from dataset import *
+from sklearn.metrics import confusion_matrix
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import os
+
+from training import *
+from network import *
+
+
+def confusion_matrix_figure(preds, labels, class_names, title):
+    """
+    Returns a figure of a normalised confusion matrix.
+    Normalised by true class (rows sum to 1).
+    """
+    cm = confusion_matrix(labels, preds, labels=list(range(len(class_names))))
+    cm_norm = cm.astype(np.float32) / cm.sum(axis=1, keepdims=True).clip(min=1)
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    im = ax.imshow(cm_norm, interpolation='nearest', cmap='Blues', vmin=0, vmax=1)
+    fig.colorbar(im, ax=ax)
+
+    ax.set_xticks(range(len(class_names)))
+    ax.set_yticks(range(len(class_names)))
+    ax.set_xticklabels(class_names, rotation=45, ha='right')
+    ax.set_yticklabels(class_names)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(title)
+
+    thresh = 0.5
+    for i in range(len(class_names)):
+        for j in range(len(class_names)):
+            ax.text(j, i, f"{cm_norm[i,j]:.2f}\n({cm[i,j]})",
+                    ha='center', va='center', fontsize=8,
+                    color='white' if cm_norm[i, j] > thresh else 'black')
+
+    fig.tight_layout()
+    return fig
+
+
+def save_checkpoint(state, filename):
+    torch.save(state, filename)
+
+
+if __name__ == "__main__":
+    CLASS_NAMES = ["mip", "hip", "shower", "lowe"]
+    dataset = LArTPCSequenceDataset("data.h5")
+    dataset = Subset(dataset, range(0, 640))
+    train_frac = 0.6
+    n_total = len(dataset)
+    n_train = int(train_frac * n_total)
+    n_val = n_total - n_train
+    
+    train_dataset, val_dataset = random_split(dataset, [n_train, n_val])
+    
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4, collate_fn=collate_fn_pad, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, collate_fn=collate_fn_pad, pin_memory=True)
+
+    device = torch.device("cuda:0")
+    num_classes = 4    # mip, hip, shower, lowe
+    class_weights = compute_class_weights(train_loader, num_classes, device=device)
+
+    num_epochs = 10
+    model = LArTPCTransformer(
+        input_dim=11,        # [x_rel, z_rel, x_abs, z_abs, width, adc, r, cosθ, sinθ, wire_pitch, wire_angle]
+        embed_dim=128, num_heads=8, ff_dim=256, num_layers=4,
+        num_classes=num_classes,
+        dropout=0.1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    criterion = nn.CrossEntropyLoss(ignore_index=-1, weight=class_weights)
+    #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=len(train_loader), epochs=num_epochs, pct_start=0.1, anneal_strategy='cos')
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=num_epochs, T_mult=1, eta_min=1e-6)
+
+    from torch.utils.tensorboard import SummaryWriter
+    
+    writer = SummaryWriter(log_dir="runs/lar_tpc_experiment")
+    global_step = 0
+
+    best_val_loss = float("inf")
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    for epoch in tqdm(range(num_epochs), "Training"):
+        train_loss, train_acc, train_preds, train_labels = train_one_epoch(model, train_loader, optimizer, criterion, device, writer=writer, epoch=epoch)
+        val_loss, val_acc, val_preds, val_labels = validate_one_epoch(model, val_loader, criterion, device)
+        scheduler.step()
+    
+        print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} Train Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+    
+        if writer is not None:
+            writer.add_scalar("Loss/Train_epoch", train_loss, epoch)
+            writer.add_scalar("Loss/Validation", val_loss, epoch)
+            writer.add_scalar("Accuracy/Train", train_acc, epoch)
+            writer.add_scalar("Accuracy/Validation", val_acc, epoch)
+    
+            train_fig = confusion_matrix_figure(
+                train_preds, train_labels, CLASS_NAMES,
+                title=f"Train confusion — epoch {epoch+1}"
+            )
+            val_fig = confusion_matrix_figure(
+                val_preds, val_labels, CLASS_NAMES,
+                title=f"Val confusion — epoch {epoch+1}"
+            )
+            writer.add_figure("Confusion/Train", train_fig, epoch)
+            writer.add_figure("Confusion/Val",   val_fig,   epoch)
+            plt.close(train_fig)
+            plt.close(val_fig)
+    
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+        }
+    
+        # --- Save every epoch ---
+        epoch_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
+        save_checkpoint(checkpoint, epoch_path)
+    
+        # --- Save best model ---
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_path = os.path.join(checkpoint_dir, "best_model.pt")
+            save_checkpoint(checkpoint, best_path)
