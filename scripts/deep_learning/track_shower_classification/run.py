@@ -55,6 +55,25 @@ def confusion_matrix_figure(preds, labels, class_names, title):
     return fig
 
 
+def get_gpu_memory_stats(device):
+    """
+    Returns a dict of current GPU memory usage in MB for the given device.
+    Returns empty dict if CUDA is not available or device is CPU.
+    """
+    if not torch.cuda.is_available() or device.type == 'cpu':
+        return {}
+
+    allocated  = torch.cuda.memory_allocated(device)  / 1024**2
+    reserved   = torch.cuda.memory_reserved(device)   / 1024**2
+    max_alloc  = torch.cuda.max_memory_allocated(device) / 1024**2
+
+    return {
+        "allocated_MB":  allocated,   # memory currently held by tensors
+        "reserved_MB":   reserved,    # memory held by pytorch allocator (includes free blocks)
+        "peak_alloc_MB": max_alloc,   # high-water mark since last reset
+    }
+
+
 def save_checkpoint(state, filename):
     torch.save(state, filename)
 
@@ -62,7 +81,7 @@ def save_checkpoint(state, filename):
 if __name__ == "__main__":
     CLASS_NAMES = ["mip", "hip", "shower", "lowe"]
     dataset = LArTPCSequenceDataset("data.h5")
-    dataset = Subset(dataset, range(0, 640))
+    #dataset = Subset(dataset, range(0, 640))
     train_frac = 0.6
     n_total = len(dataset)
     n_train = int(train_frac * n_total)
@@ -101,6 +120,7 @@ if __name__ == "__main__":
         train_loss, train_acc, train_preds, train_labels = train_one_epoch(model, train_loader, optimizer, criterion, device, writer=writer, epoch=epoch)
         val_loss, val_acc, val_preds, val_labels = validate_one_epoch(model, val_loader, criterion, device)
         scheduler.step()
+        torch.cuda.reset_peak_memory_stats(device)
     
         print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} Train Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
     
@@ -109,6 +129,10 @@ if __name__ == "__main__":
             writer.add_scalar("Loss/Validation", val_loss, epoch)
             writer.add_scalar("Accuracy/Train", train_acc, epoch)
             writer.add_scalar("Accuracy/Validation", val_acc, epoch)
+
+            gpu_stats = get_gpu_memory_stats(device)
+            for name, value in gpu_stats.items():
+                writer.add_scalar(f"GPU/{name}", value, epoch)
     
             train_fig = confusion_matrix_figure(
                 train_preds, train_labels, CLASS_NAMES,
