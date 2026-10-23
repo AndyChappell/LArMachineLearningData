@@ -45,6 +45,11 @@ then
   download "HmBOi1FbU3ZY6V2" "PandoraBdt_PfoCharacterisation_DUNEFD_HD_v04_06_00.xml"
   download "Lq6p8HHoUacyVub" "PandoraBdt_PfoCharacterisation_DUNEFD_VD_v04_06_00.xml"
   download "TXa87V98R46HQSw" "PandoraBdt_Vertexing_DUNEFD_v03_27_00.xml"
+
+  if [[ "$2" == "atmos" ]]
+  then
+    download "sEfZQho8coz8s67" "PandoraBdt_PfoCharacterisation_DUNEFD_HD_Atmos_v04_07_00.xml"
+  fi
 fi
 
 # DUNE ND
@@ -117,12 +122,12 @@ then
 
   if [[ "$2" == "atmos" ]]
   then
-    download "2oPV4CspjWR1mHi" "PandoraNet_Vertex_DUNEFD_HD_Atmos_1_U_v04_03_00.pt"
-    download "Ok8axRtsxcW1TDj" "PandoraNet_Vertex_DUNEFD_HD_Atmos_1_V_v04_03_00.pt"
-    download "zwBHUyYM0CVUOKx" "PandoraNet_Vertex_DUNEFD_HD_Atmos_1_W_v04_03_00.pt"
-    download "nKuPKh6vZwlODFJ" "PandoraNet_Vertex_DUNEFD_HD_Atmos_2_U_v04_03_00.pt"
-    download "bM7ZRlCRabeRbOu" "PandoraNet_Vertex_DUNEFD_HD_Atmos_2_V_v04_03_00.pt"
-    download "QNZfK3YdG2Hebxn" "PandoraNet_Vertex_DUNEFD_HD_Atmos_2_W_v04_03_00.pt"
+    download "nR4KKR8fjnFCiL8" "PandoraNet_Vertex_DUNEFD_HD_Atmos_1_U_v04_07_00.pt"
+    download "ffRxyLcLEKqbxWA" "PandoraNet_Vertex_DUNEFD_HD_Atmos_1_V_v04_07_00.pt"
+    download "0Gp85SRCGOudYOH" "PandoraNet_Vertex_DUNEFD_HD_Atmos_1_W_v04_07_00.pt"
+    download "oNZcQGPoDGyHCK8" "PandoraNet_Vertex_DUNEFD_HD_Atmos_2_U_v04_07_00.pt"
+    download "na4M6YzTXpM9BDm" "PandoraNet_Vertex_DUNEFD_HD_Atmos_2_V_v04_07_00.pt"
+    download "jZk4r1Sgae3n1nx" "PandoraNet_Vertex_DUNEFD_HD_Atmos_2_W_v04_07_00.pt"
 
     download "lfnGRndqKcpYo3Z" "PandoraNet_ShowerGrowing_DUNEFD_HD_Attn_v05_00_00.pt"
     download "fXVLcSoh5s6RdDW" "PandoraNet_ShowerGrowing_DUNEFD_HD_Encoder_v05_00_00.pt"
